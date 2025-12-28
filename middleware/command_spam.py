@@ -48,16 +48,16 @@ class CommandSpamMiddleware(BaseMiddleware):
                             await utilities_db.add_command_detection(message.chat.id, command_text)
                             logger.debug(f"Обнаружена команда {command_text} в сообщении от пользователя {message.from_user.id} в чате {message.chat.id}")
             
-            logger.debug(f"CommandSpamMiddleware: не команда, пропускаем: {message.text[:50] if message.text else 'None'}")
+            logger.debug(f"CommandSpamMiddleware: не команда, пропускаем")
             return await handler(event, data)
         
-        logger.debug(f"CommandSpamMiddleware: обрабатываем команду: {message.text}")
+        logger.debug(f"CommandSpamMiddleware: обрабатываем команду")
         
         # Это команда, начинающаяся с /
         utilities_settings = await utilities_db.get_settings(message.chat.id)
         
         if not utilities_settings.get('fake_commands_enabled', False):
-            logger.debug(f"CommandSpamMiddleware: fake_commands_enabled=False, пропускаем команду {message.text}")
+            logger.debug(f"CommandSpamMiddleware: fake_commands_enabled=False, пропускаем команду")
             return await handler(event, data)
         
         # Извлекаем команду из текста (первое слово)
