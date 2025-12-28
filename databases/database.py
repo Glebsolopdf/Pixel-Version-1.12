@@ -341,6 +341,17 @@ class Database:
                     CREATE INDEX IF NOT EXISTS idx_user_daily_stats_chat_date_user_count 
                     ON user_daily_stats (chat_id, date, user_id, message_count)
                 """)
+                
+                # Уникальный индекс для предотвращения дубликатов (chat_id, user_id, date)
+                try:
+                    db.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_daily_stats_unique 
+                        ON user_daily_stats (chat_id, user_id, date)
+                    """)
+                except sqlite3.OperationalError as e:
+                    # Если индекс уже существует или есть дубликаты, пропускаем
+                    # Дубликаты будут очищены при следующем запуске cleanup_duplicate_chats
+                    logger.debug(f"Не удалось создать уникальный индекс user_daily_stats: {e}")
 
                 db.execute("""
                     CREATE INDEX IF NOT EXISTS idx_user_chat_meta_chat_user
@@ -1386,16 +1397,61 @@ class Database:
                     # Включаем настройки производительности
                     _apply_pragma_settings(db)
                     
-                    # Ищем существующую запись пользователя за день
+                    # Проверяем, есть ли дубликаты для этого пользователя за этот день
                     cursor = db.execute("""
-                        SELECT message_count FROM user_daily_stats 
+                        SELECT COUNT(*) FROM user_daily_stats 
                         WHERE chat_id = ? AND user_id = ? AND date = ?
                     """, (chat_id, user_id, date))
-                    row = cursor.fetchone()
+                    record_count = cursor.fetchone()[0]
                     
-                    if row:
-                        # Запись уже существует, увеличиваем счетчик
-                        new_count = row[0] + 1
+                    if record_count > 1:
+                        # Есть дубликаты - удаляем их и суммируем message_count
+                        cursor = db.execute("""
+                            SELECT SUM(message_count) as total_count
+                            FROM user_daily_stats
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                        """, (chat_id, user_id, date))
+                        total_count_row = cursor.fetchone()
+                        total_count = total_count_row[0] if total_count_row and total_count_row[0] is not None else 0
+                        
+                        # Удаляем все дубликаты, оставляем только одну запись с максимальным rowid
+                        db.execute("""
+                            DELETE FROM user_daily_stats 
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                            AND rowid NOT IN (
+                                SELECT MAX(rowid) 
+                                FROM user_daily_stats 
+                                WHERE chat_id = ? AND user_id = ? AND date = ?
+                            )
+                        """, (chat_id, user_id, date, chat_id, user_id, date))
+                        
+                        # Обновляем оставшуюся запись с суммированным счетчиком + 1
+                        new_count = total_count + 1
+                        cursor = db.execute("""
+                            UPDATE user_daily_stats 
+                            SET message_count = ?, username = ?, first_name = ?, last_name = ?
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                        """, (new_count, username, first_name, last_name, chat_id, user_id, date))
+                        
+                        # Если запись не была обновлена (не найдена после удаления), создаем новую
+                        if cursor.rowcount == 0:
+                            logger.warning(f"Запись не найдена после удаления дубликатов, создаем новую для user_id={user_id}, chat_id={chat_id}, date={date}")
+                            db.execute("""
+                                INSERT INTO user_daily_stats 
+                                (chat_id, user_id, date, message_count, username, first_name, last_name)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (chat_id, user_id, date, new_count, username, first_name, last_name))
+                    elif record_count == 1:
+                        # Запись уже существует (одна), увеличиваем счетчик
+                        cursor = db.execute("""
+                            SELECT message_count FROM user_daily_stats 
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                        """, (chat_id, user_id, date))
+                        row = cursor.fetchone()
+                        if row and row[0] is not None:
+                            new_count = row[0] + 1
+                        else:
+                            new_count = 1
                         db.execute("""
                             UPDATE user_daily_stats 
                             SET message_count = ?, username = ?, first_name = ?, last_name = ?
@@ -1403,11 +1459,31 @@ class Database:
                         """, (new_count, username, first_name, last_name, chat_id, user_id, date))
                     else:
                         # Записи нет, создаем новую
-                        db.execute("""
-                            INSERT INTO user_daily_stats 
-                            (chat_id, user_id, date, message_count, username, first_name, last_name)
-                            VALUES (?, ?, ?, 1, ?, ?, ?)
-                        """, (chat_id, user_id, date, username, first_name, last_name))
+                        # Используем INSERT OR IGNORE для защиты от возможных конфликтов с уникальным индексом
+                        # Если запись уже существует (race condition), обновим её
+                        try:
+                            db.execute("""
+                                INSERT INTO user_daily_stats 
+                                (chat_id, user_id, date, message_count, username, first_name, last_name)
+                                VALUES (?, ?, ?, 1, ?, ?, ?)
+                            """, (chat_id, user_id, date, username, first_name, last_name))
+                        except sqlite3.IntegrityError:
+                            # Если возникла ошибка уникальности (индекс уже создан и есть запись),
+                            # обновляем существующую запись
+                            cursor = db.execute("""
+                                SELECT message_count FROM user_daily_stats 
+                                WHERE chat_id = ? AND user_id = ? AND date = ?
+                            """, (chat_id, user_id, date))
+                            row = cursor.fetchone()
+                            if row and row[0] is not None:
+                                new_count = row[0] + 1
+                            else:
+                                new_count = 1
+                            db.execute("""
+                                UPDATE user_daily_stats 
+                                SET message_count = ?, username = ?, first_name = ?, last_name = ?
+                                WHERE chat_id = ? AND user_id = ? AND date = ?
+                            """, (new_count, username, first_name, last_name, chat_id, user_id, date))
                     
                     db.commit()
                     return True
@@ -1995,6 +2071,49 @@ class Database:
                         """, (chat_id, date, chat_id, date))
                         
                         total_cleaned += result.rowcount
+                    
+                    # Очищаем дубликаты в user_daily_stats
+                    cursor = db.execute("""
+                        SELECT chat_id, user_id, date, COUNT(*) as count
+                        FROM user_daily_stats
+                        GROUP BY chat_id, user_id, date
+                        HAVING COUNT(*) > 1
+                    """)
+                    user_stats_duplicates = cursor.fetchall()
+                    
+                    for chat_id, user_id, date, count in user_stats_duplicates:
+                        logger.info(f"Найден дубликат статистики пользователя {user_id} в чате {chat_id} на дату {date} ({count} записей)")
+                        
+                        # Находим запись с максимальным message_count (или самую новую по rowid, если счетчики равны)
+                        # Сначала суммируем все message_count для этого пользователя
+                        cursor = db.execute("""
+                            SELECT SUM(message_count) as total_count
+                            FROM user_daily_stats
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                        """, (chat_id, user_id, date))
+                        total_count_row = cursor.fetchone()
+                        total_count = total_count_row[0] if total_count_row else 0
+                        
+                        # Оставляем только одну запись с максимальным rowid, обновляем её message_count на сумму всех
+                        result = db.execute("""
+                            DELETE FROM user_daily_stats 
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                            AND rowid NOT IN (
+                                SELECT MAX(rowid) 
+                                FROM user_daily_stats 
+                                WHERE chat_id = ? AND user_id = ? AND date = ?
+                            )
+                        """, (chat_id, user_id, date, chat_id, user_id, date))
+                        
+                        # Обновляем оставшуюся запись с правильным message_count
+                        db.execute("""
+                            UPDATE user_daily_stats
+                            SET message_count = ?
+                            WHERE chat_id = ? AND user_id = ? AND date = ?
+                        """, (total_count, chat_id, user_id, date))
+                        
+                        total_cleaned += result.rowcount
+                        logger.info(f"Удалено {result.rowcount} дубликатов для пользователя {user_id} в чате {chat_id} на дату {date}, обновлен счетчик до {total_count}")
                     
                     db.commit()
                     logger.info(f"Всего очищено {total_cleaned} дубликатов")
