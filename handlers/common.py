@@ -64,8 +64,11 @@ def register_common_handlers(dispatcher: Dispatcher, bot_instance: Bot):
     dp.message.register(help_command, Command("help"))
     dp.message.register(reset_day_stat_command, Command("resetdaystat"))
     dp.message.register(private_message_handler, F.chat.type == 'private', ~F.text.startswith('/'))
-    dp.message.register(bot_mention_handler, F.chat.type.in_(['group', 'supergroup']), F.text, ~F.text.startswith('/'))
+    # Регистрируем message_handler ПЕРЕД bot_mention_handler, чтобы он вызывался первым
+    # message_handler должен обрабатывать все сообщения для статистики
     dp.message.register(message_handler, ~F.text.startswith('/'), ~F.new_chat_members, ~F.left_chat_member)
+    # bot_mention_handler обрабатывает упоминания бота (регистрируется после message_handler)
+    dp.message.register(bot_mention_handler, F.chat.type.in_(['group', 'supergroup']), ~F.text.startswith('/'))
 
 
 async def create_main_menu():
@@ -484,9 +487,8 @@ async def command_alias_handler(message: Message):
     from handlers.settings import settings_command, selfdemote_command, rules_command
     from handlers.raid_protection import raid_protection_command
     
-    text = message.text.strip()
+    text = message.text.strip() if message.text else ""
     chat_id = message.chat.id
-    logger.info(f"command_alias_handler вызван для текста: '{text}' в чате {chat_id} ({message.chat.type})")
     
     requires_prefix = await db.get_russian_commands_prefix_setting(chat_id)
     
@@ -1028,6 +1030,7 @@ async def message_handler(message: Message):
                         
                         await raid_protection_db.update_last_notification_time(chat_id, datetime.now().isoformat())
             
+            logger.info(f"🚫 Сообщение от {user_id} в чате {chat_id} определено как рейд, статистика не засчитывается")
             return
         
         utilities_settings = await utilities_db.get_settings(chat_id)
@@ -1061,6 +1064,7 @@ async def message_handler(message: Message):
                     logger.info(f"Удалено сообщение с {total_emoji_count} эмодзи (кастомных: {custom_emoji_count}, обычных: {regular_emoji_count}) от пользователя {message.from_user.id} в чате {chat_id}")
                 except Exception as e:
                     logger.error(f"Ошибка при удалении сообщения с эмодзи спамом: {e}")
+                logger.info(f"🚫 Сообщение от {message.from_user.id} в чате {chat_id} удалено как эмодзи спам, статистика не засчитывается")
                 return
         
         if utilities_settings.get('fake_commands_enabled', False) and message.text and message.entities:
@@ -1072,8 +1076,14 @@ async def message_handler(message: Message):
         
         stat_settings = await db.get_chat_stat_settings(chat_id)
         
+        # Проверяем, включена ли статистика для чата
+        if not stat_settings.get('stats_enabled', True):
+            logger.info(f"🚫 Статистика отключена для чата {chat_id}, пропускаем сообщение")
+            return
+        
         if not stat_settings.get('count_media', True):
             if message.content_type != 'text':
+                logger.info(f"🚫 Медиа-сообщения не учитываются в статистике для чата {chat_id}, пропускаем (content_type={message.content_type})")
                 return
         
         user_name = message.from_user.first_name or f"@{message.from_user.username}" if message.from_user.username else f"ID{message.from_user.id}"
@@ -1095,7 +1105,7 @@ async def message_handler(message: Message):
                     )
                     await db.update_user_last_message_time(chat_id, message.from_user.id, current_time.isoformat())
                 elif time_diff < 1:
-                    logger.info(f"🚫 Сообщение пропущено от {user_name} ({message.from_user.id}) в чате \"{chat_name}\" (прошло {time_diff:.3f}с)")
+                    logger.info(f"🚫 Сообщение пропущено от {user_name} ({message.from_user.id}) в чате \"{chat_name}\" (прошло {time_diff:.3f}с) - слишком быстро после предыдущего, статистика не засчитывается")
                     return
             except ValueError:
                 logger.warning(f"Неверный формат времени: {last_message_time_str}")
@@ -1126,21 +1136,32 @@ async def message_handler(message: Message):
             is_bot=message.from_user.is_bot
         )
         
-        result1 = await db.increment_message_count(chat_id)
-        logger.debug(f"increment_message_count для чата {chat_id}: {result1}")
+        try:
+            await db.increment_message_count(chat_id)
+        except Exception as e:
+            logger.error(f"Ошибка при increment_message_count для чата {chat_id}: {e}", exc_info=True)
         
-        result2 = await db.increment_user_message_count(
-            chat_id=chat_id,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name
-        )
-        logger.debug(f"increment_user_message_count для пользователя {message.from_user.id} в чате {chat_id}: {result2}")
+        try:
+            result2 = await db.increment_user_message_count(
+                chat_id=chat_id,
+                user_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name
+            )
+            if not result2:
+                logger.warning(f"⚠️ increment_user_message_count вернул False для пользователя {message.from_user.id} в чате {chat_id}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при increment_user_message_count для пользователя {message.from_user.id} в чате {chat_id}: {e}", exc_info=True)
 
-        await db.ensure_user_first_seen(chat_id, message.from_user.id)
-        await db.update_user_last_message_time(chat_id, message.from_user.id, current_time.isoformat())
-        logger.info(f"✅ Обработано сообщение от {user_name} ({message.from_user.id}) в чате \"{chat_name}\"")
+        try:
+            await db.ensure_user_first_seen(chat_id, message.from_user.id)
+            await db.update_user_last_message_time(chat_id, message.from_user.id, current_time.isoformat())
+            logger.info(f"✅ Обработано сообщение от {user_name} ({message.from_user.id}) в чате \"{chat_name}\"")
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении метаданных пользователя {message.from_user.id} в чате {chat_id}: {e}", exc_info=True)
+    else:
+        logger.debug(f"message_handler: чат {message.chat.id} не является group/supergroup (тип: {message.chat.type}), пропускаем")
 
 
 async def new_chat_member(message: Message):
