@@ -498,16 +498,63 @@ async def command_alias_handler(message: Message):
     
     text_lower = text.lower()
     is_clear_rules = False
+    is_rules_command = False
+    
+    # Проверяем специальные случаи для команды rules
     if text_lower == "очистить" or text_lower == "правила очистить" or text_lower.startswith("правила очистить"):
         english_command = "rules"
         is_clear_rules = True
+        is_rules_command = True
     else:
         english_command = get_command_alias(text)
+        if english_command == "rules":
+            is_rules_command = True
     
     if not english_command:
         return
     
-    if '\n' in text:
+    # Специальная обработка для команды rules - сохраняем всё форматирование
+    if is_rules_command:
+        # Находим позицию слова "правила" (с учетом регистра)
+        rules_word = "правила"
+        rules_pos_lower = text_lower.find(rules_word)
+        
+        if rules_pos_lower != -1:
+            # Находим конец слова "правила" в оригинальном тексте
+            # Ищем границу слова (конец "правила" + пробелы)
+            end_pos = rules_pos_lower + len(rules_word)
+            # Пропускаем пробелы после слова "правила"
+            while end_pos < len(text) and text[end_pos].isspace():
+                end_pos += 1
+            
+            # Извлекаем всё после слова "правила", сохраняя оригинальное форматирование
+            if end_pos < len(text):
+                rules_text = text[end_pos:]
+                if is_clear_rules:
+                    new_text = f"/{english_command} clear"
+                elif rules_text.strip().lower() == "clear":
+                    new_text = f"/{english_command} clear"
+                elif rules_text.strip():
+                    # Сохраняем весь текст правил с форматированием
+                    # Добавляем пробел только если текст не начинается с пробела или переноса строки
+                    if rules_text and not rules_text[0].isspace():
+                        new_text = f"/{english_command} {rules_text}"
+                    else:
+                        new_text = f"/{english_command}{rules_text}"
+                else:
+                    new_text = f"/{english_command}"
+            else:
+                new_text = f"/{english_command}"
+        else:
+            # Если не нашли слово "правила", используем стандартную обработку
+            if is_clear_rules:
+                new_text = f"/{english_command} clear"
+            else:
+                new_text = f"/{english_command}"
+        
+        new_message = message.model_copy(update={"text": new_text})
+    elif '\n' in text:
+        # Обработка для других команд с переносом строки
         lines = text.split('\n', 1)
         command_line = lines[0].strip()
         reason_line = lines[1].strip()
@@ -522,8 +569,6 @@ async def command_alias_handler(message: Message):
                 new_text = f"/{english_command} {args}\n{reason_line}"
             else:
                 new_text = f"/{english_command}\n{reason_line}"
-        elif is_clear_rules:
-            new_text = f"/{english_command} clear\n{reason_line}"
         elif len(words) > 1:
             args = " ".join(words[1:])
             new_text = f"/{english_command} {args}\n{reason_line}"
@@ -532,6 +577,7 @@ async def command_alias_handler(message: Message):
         
         new_message = message.model_copy(update={"text": new_text})
     else:
+        # Обработка для других команд без переноса строки
         words = text.split()
         
         if english_command == "myprofile_self":
@@ -542,8 +588,6 @@ async def command_alias_handler(message: Message):
                 new_text = f"/{english_command} {args}"
             else:
                 new_text = f"/{english_command}"
-        elif is_clear_rules:
-            new_text = f"/{english_command} clear"
         elif len(words) > 1:
             args = " ".join(words[1:])
             new_text = f"/{english_command} {args}"

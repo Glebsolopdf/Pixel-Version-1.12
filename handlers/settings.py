@@ -708,14 +708,15 @@ async def rules_command(message: Message):
     command_text = message.text or ""
     logger.debug(f"Исходный command_text: '{command_text}'")
     
-    match = re.match(r'^/rules(@\w+)?\s*(.*)$', command_text, re.IGNORECASE)
+    match = re.match(r'^/rules(@\w+)?\s*(.*)$', command_text, re.IGNORECASE | re.DOTALL)
     if match:
-        command_text = match.group(2).strip()  # Извлекаем только аргументы (все после команды)
+        command_text = match.group(2)  # Извлекаем только аргументы (все после команды), сохраняя форматирование
     else:
         command_text = ""
     
     logger.debug(f"command_text после обработки: '{command_text}', пустой: {not command_text or not command_text.strip()}")
     
+    # Проверяем, пустой ли текст (после удаления пробелов в начале и конце)
     if not command_text or not command_text.strip():
         logger.info(f"Показываем правила для чата {chat_id}")
         try:
@@ -758,9 +759,10 @@ async def rules_command(message: Message):
         await message.answer(quote)
         return
     
-    rules_text = command_text.strip()
+    # Проверяем на "clear" (без учета пробелов в начале/конце)
+    rules_text_stripped = command_text.strip()
     
-    if rules_text.lower() == "clear":
+    if rules_text_stripped.lower() == "clear":
         success = await db.set_rules_text(chat_id, None)
         if success:
             await message.answer("✅ Правила чата удалены.")
@@ -768,19 +770,27 @@ async def rules_command(message: Message):
             await message.answer("❌ Ошибка при удалении правил.")
         return
     
-    if len(rules_text) > 4000:
+    # Используем оригинальный текст с форматированием для сохранения
+    rules_text = command_text
+    
+    # Убираем только ведущие и завершающие пробелы/переносы для проверки длины
+    rules_text_for_validation = rules_text.strip()
+    
+    if len(rules_text_for_validation) > 4000:
         await message.answer(
             f"❌ Текст правил слишком длинный!\n\n"
-            f"Текущая длина: {len(rules_text)} символов\n"
+            f"Текущая длина: {len(rules_text_for_validation)} символов\n"
             f"Максимальная длина: 4000 символов"
         )
         return
     
-    is_valid, error_msg = is_text_meaningful(rules_text)
+    # Проверка качества текста использует текст без ведущих/завершающих пробелов
+    is_valid, error_msg = is_text_meaningful(rules_text_for_validation)
     if not is_valid:
         await message.answer(f"❌ {error_msg}")
         return
     
+    # Сохраняем оригинальный текст для preview (до замены на HTML)
     original_rules_text = rules_text
     
     rules_text = re.sub(
