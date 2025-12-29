@@ -26,6 +26,7 @@ from raid_protection import raid_protection
 from databases.raid_protection_db import raid_protection_db
 from databases.moderation_db import moderation_db
 from databases.utilities_db import utilities_db
+from databases.reputation_db import reputation_db
 
 logger = logging.getLogger(__name__)
 
@@ -905,9 +906,16 @@ async def message_handler(message: Message):
                         del _recently_muted_cache[cache_key]
                 
                 if not recently_muted:
+                    # Отмечаем что обрабатываем этот мут ДО попытки применения
+                    _recently_muted_cache[cache_key] = current_time
+                    
                     logger.info(f"Попытка применить мут для пользователя {user_id} в чате {chat_id}")
                     try:
                         mute_until = datetime.now() + timedelta(seconds=mute_duration)
+                        
+                        # Проверяем активные наказания в БД перед применением
+                        active_punishments = await moderation_db.get_active_punishments(chat_id, "mute")
+                        user_is_muted_in_db = any(punish['user_id'] == user_id for punish in active_punishments)
                         
                         user_is_muted = False
                         try:
@@ -924,47 +932,54 @@ async def message_handler(message: Message):
                                 logger.info(f"Пользователь {user_id} имеет статус '{chat_member.status}', не замучен")
                         except Exception as e:
                             logger.warning(f"Не удалось проверить статус пользователя {user_id} в чате {chat_id}: {e}")
-                            active_punishments = await moderation_db.get_active_punishments(chat_id, "mute")
-                            user_is_muted = any(punish['user_id'] == user_id for punish in active_punishments)
+                            user_is_muted = user_is_muted_in_db
                             logger.info(f"Проверка через БД: user_is_muted={user_is_muted}")
                         
-                        if user_is_muted:
+                        # Если уже замучен в БД или в Telegram, пропускаем
+                        if user_is_muted or user_is_muted_in_db:
                             logger.info(f"Пользователь {user_id} уже замучен, пропускаем")
+                            # Оставляем кэш, чтобы предотвратить повторные попытки
                         
-                        if not user_is_muted:
+                        if not user_is_muted and not user_is_muted_in_db:
                             from aiogram.types import ChatPermissions
-                            await bot.restrict_chat_member(
-                                chat_id=chat_id,
-                                user_id=user_id,
-                                permissions=ChatPermissions(
-                                    can_send_messages=False,
-                                    can_send_media_messages=False,
-                                    can_send_polls=False,
-                                    can_send_other_messages=False,
-                                    can_add_web_page_previews=False,
-                                    can_change_info=False,
-                                    can_invite_users=False,
-                                    can_pin_messages=False
-                                ),
-                                until_date=mute_until
-                            )
-                            
-                            await moderation_db.add_punishment(
-                                chat_id=chat_id,
-                                user_id=user_id,
-                                moderator_id=bot.id,
-                                punishment_type="mute",
-                                reason=f"Автоматический мут за рейд ({raid_type})",
-                                expiry_date=mute_until.isoformat(),
-                                user_username=message.from_user.username,
-                                user_first_name=message.from_user.first_name,
-                                moderator_username=None,
-                                moderator_first_name=BOT_NAME
-                            )
-                            
-                            auto_mute_applied = True
-                            duration_minutes = mute_duration // 60
-                            logger.info(f"Автоматический мут применен к пользователю {user_id} в чате {chat_id} на {duration_minutes} минут")
+                            try:
+                                await bot.restrict_chat_member(
+                                    chat_id=chat_id,
+                                    user_id=user_id,
+                                    permissions=ChatPermissions(
+                                        can_send_messages=False,
+                                        can_send_media_messages=False,
+                                        can_send_polls=False,
+                                        can_send_other_messages=False,
+                                        can_add_web_page_previews=False,
+                                        can_change_info=False,
+                                        can_invite_users=False,
+                                        can_pin_messages=False
+                                    ),
+                                    until_date=mute_until
+                                )
+                                
+                                await moderation_db.add_punishment(
+                                    chat_id=chat_id,
+                                    user_id=user_id,
+                                    moderator_id=bot.id,
+                                    punishment_type="mute",
+                                    reason=f"Автоматический мут за рейд ({raid_type})",
+                                    expiry_date=mute_until.isoformat(),
+                                    user_username=message.from_user.username,
+                                    user_first_name=message.from_user.first_name,
+                                    moderator_username=None,
+                                    moderator_first_name=BOT_NAME
+                                )
+                                
+                                auto_mute_applied = True
+                                duration_minutes = mute_duration // 60
+                                logger.info(f"Автоматический мут применен к пользователю {user_id} в чате {chat_id} на {duration_minutes} минут")
+                            except Exception as mute_error:
+                                # Если не удалось применить мут, удаляем из кэша, чтобы можно было повторить попытку
+                                if cache_key in _recently_muted_cache:
+                                    del _recently_muted_cache[cache_key]
+                                raise mute_error
                             
                     except Exception as e:
                         logger.error(f"Ошибка при применении автоматического мута: {e}")
@@ -1421,17 +1436,23 @@ async def reaction_spam_handler(reaction_update: types.MessageReactionUpdated):
             
             has_warning = await utilities_db.has_recent_warning(chat_id, user_id, window)
             
+            # Проверяем настройку silent mode
+            reaction_spam_silent = utilities_settings.get('reaction_spam_silent', False)
+            
             if warning_enabled and not has_warning:
                 try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⚠️ <b>Предупреждение</b>\n\n"
-                             f"Пользователь <b>{get_user_mention_html(reaction_update.user)}</b> "
-                             f"отправляет слишком много реакций. Пожалуйста, успокойтесь.",
-                        parse_mode=ParseMode.HTML
-                    )
                     await utilities_db.add_reaction_warning(chat_id, user_id)
                     logger.info(f"Отправлено предупреждение за спам реакциями пользователю {user_id} в чате {chat_id}")
+                    
+                    # Отправляем сообщение в чат только если silent mode выключен
+                    if not reaction_spam_silent:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ <b>Предупреждение</b>\n\n"
+                                 f"Пользователь <b>{get_user_mention_html(reaction_update.user)}</b> "
+                                 f"отправляет слишком много реакций. Пожалуйста, успокойтесь.",
+                            parse_mode=ParseMode.HTML
+                        )
                 except Exception as e:
                     logger.error(f"Ошибка при отправке предупреждения за спам реакциями: {e}")
             else:
@@ -1458,14 +1479,21 @@ async def reaction_spam_handler(reaction_update: types.MessageReactionUpdated):
                             from handlers.moderation import restore_user_mutes
                             await restore_user_mutes(chat_id, user_id)
                         
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=f"💨 Пользователь <b>{get_user_mention_html(reaction_update.user)}</b> "
-                                 f"исключен за спам реакциями.",
-                            parse_mode=ParseMode.HTML
-                        )
                         logger.info(f"Пользователь {user_id} исключен за спам реакциями в чате {chat_id}")
+                        
+                        # Отправляем сообщение в чат только если silent mode выключен
+                        if not reaction_spam_silent:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"💨 Пользователь <b>{get_user_mention_html(reaction_update.user)}</b> "
+                                     f"исключен за спам реакциями.",
+                                parse_mode=ParseMode.HTML
+                            )
                     elif punishment == 'ban':
+                        # Проверяем, есть ли активные муты у пользователя (чтобы сохранить их)
+                        active_mutes = await moderation_db.get_active_punishments(chat_id, "mute")
+                        has_active_mutes = any(mute['user_id'] == user_id for mute in active_mutes)
+                        
                         ban_until = datetime.now() + timedelta(seconds=ban_duration)
                         await bot.ban_chat_member(
                             chat_id=chat_id,
@@ -1473,14 +1501,78 @@ async def reaction_spam_handler(reaction_update: types.MessageReactionUpdated):
                             until_date=ban_until
                         )
                         
-                        ban_duration_text = format_mute_duration(ban_duration)
-                        await bot.send_message(
+                        # Сохраняем бан в базу данных
+                        await moderation_db.add_punishment(
                             chat_id=chat_id,
-                            text=f"🚫 Пользователь <b>{get_user_mention_html(reaction_update.user)}</b> "
-                                 f"забанен на <b>{ban_duration_text}</b> за спам реакциями.",
-                            parse_mode=ParseMode.HTML
+                            user_id=user_id,
+                            moderator_id=bot.id,
+                            punishment_type="ban",
+                            reason="Автоматический бан за спам реакциями",
+                            duration_seconds=ban_duration,
+                            expiry_date=ban_until.isoformat(),
+                            user_username=reaction_update.user.username,
+                            user_first_name=reaction_update.user.first_name,
+                            user_last_name=reaction_update.user.last_name,
+                            moderator_username=None,
+                            moderator_first_name=BOT_NAME
                         )
-                        logger.info(f"Пользователь {user_id} забанен на {ban_duration} сек за спам реакциями в чате {chat_id}")
+                        
+                        # Обновляем репутацию
+                        penalty = reputation_db.calculate_reputation_penalty('ban', ban_duration)
+                        await reputation_db.add_recent_punishment(user_id, 'ban', ban_duration)
+                        await reputation_db.update_reputation(user_id, penalty)
+                        
+                        # Примечание: муты будут восстановлены автоматически когда пользователь вернется и отправит сообщение
+                        # (см. message_handler, строки 1187-1191)
+                        # Для временных банов это нормально, так как пользователь не может вернуться пока бан активен
+                        
+                        logger.info(f"Пользователь {user_id} забанен на {ban_duration} сек за спам реакциями в чате {chat_id} (активных мутов: {len([m for m in active_mutes if m['user_id'] == user_id])})")
+                        
+                        # Отправляем сообщение в чат только если silent mode выключен
+                        if not reaction_spam_silent:
+                            ban_duration_text = format_mute_duration(ban_duration)
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🚫 Пользователь <b>{get_user_mention_html(reaction_update.user)}</b> "
+                                     f"забанен на <b>{ban_duration_text}</b> за спам реакциями.",
+                                parse_mode=ParseMode.HTML
+                            )
+                        
+                        # Отправляем уведомление пользователю
+                        try:
+                            chat_info = await bot.get_chat(chat_id)
+                            chat_title = chat_info.title or "Неизвестный чат"
+                            
+                            builder = InlineKeyboardBuilder()
+                            
+                            if chat_info.username:
+                                chat_url = f"https://t.me/{chat_info.username}"
+                            else:
+                                chat_id_str = str(chat_id)
+                                if chat_id_str.startswith('-100'):
+                                    chat_id_str = chat_id_str[4:]
+                                chat_url = f"https://t.me/c/{chat_id_str}"
+                            
+                            builder.add(InlineKeyboardButton(
+                                text="💬 Открыть чат",
+                                url=chat_url
+                            ))
+                            
+                            ban_duration_text = format_mute_duration(ban_duration)
+                            await bot.send_message(
+                                user_id,
+                                f"🚫 <b>Вы были забанены</b>\n\n"
+                                f"В чате <b>{chat_title}</b> вы получили временный бан на <b>{ban_duration_text}</b> за спам реакциями.",
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=builder.as_markup()
+                            )
+                        except Exception as e:
+                            error_str = str(e).lower()
+                            # Ошибка "bot can't initiate conversation" - пользователь не писал боту или заблокировал его
+                            if "can't initiate conversation" in error_str or "forbidden" in error_str:
+                                logger.debug(f"Не удалось отправить уведомление пользователю {user_id}: пользователь не писал боту или заблокировал его")
+                            else:
+                                logger.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
                 except Exception as e:
                     logger.error(f"Ошибка при применении наказания за спам реакциями: {e}")
     except Exception as e:
@@ -1511,7 +1603,9 @@ async def handle_my_chat_member(update: ChatMemberUpdated):
                 logger.info(f"Бот был удален из чата {chat_id} (статус: {new_status}), данные заморожены")
                 return
             
-            if old_status != 'administrator' and new_status == 'administrator':
+            # Проверяем, что бот только что получил права администратора после реального добавления в чат
+            # (старый статус был 'left' или 'kicked'), а не просто изменились права
+            if old_status in ['left', 'kicked'] and new_status == 'administrator':
                 owner_id = None
                 if update.chat.type in ['group', 'supergroup']:
                     try:

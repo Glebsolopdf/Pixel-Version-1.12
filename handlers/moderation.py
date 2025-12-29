@@ -16,11 +16,13 @@ from aiogram.enums import ParseMode
 from databases.database import db
 from databases.moderation_db import moderation_db
 from databases.reputation_db import reputation_db
+from databases.raid_protection_db import raid_protection_db
 from utils.permissions import get_effective_rank, check_permission
 from utils.formatting import (
     parse_mute_duration, get_user_mention_html, parse_command_with_reason,
     format_mute_duration
 )
+from utils.error_handler import get_error_message
 from utils.gifs import send_message_with_gif
 from utils.constants import RANK_OWNER, RANK_NAMES
 from utils.cooldowns import should_show_hint
@@ -290,7 +292,8 @@ async def mute_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при применении мута пользователю {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при применении мута")
+        error_msg = get_error_message(e, "мута")
+        await message.answer(error_msg)
 
 
 async def restore_user_mutes(chat_id: int, user_id: int) -> bool:
@@ -440,6 +443,36 @@ async def unmute_command(message: Message):
         await message.answer("ℹ️ Владелец и администраторы не могут быть замучены")
         return
     
+    # Проверяем, действительно ли пользователь замучен
+    is_muted = False
+    
+    # Проверяем активные муты в базе данных
+    try:
+        active_punishments = await moderation_db.get_active_punishments(chat_id, "mute")
+        for punishment in active_punishments:
+            if punishment['user_id'] == target_user.id:
+                is_muted = True
+                break
+    except Exception as e:
+        logger.warning(f"Ошибка при проверке активных мутов для пользователя {target_user.id}: {e}")
+    
+    # Проверяем статус пользователя в Telegram
+    if not is_muted:
+        try:
+            chat_member = await bot.get_chat_member(chat_id, target_user.id)
+            if chat_member.status == 'restricted':
+                if hasattr(chat_member, 'permissions') and chat_member.permissions:
+                    if not chat_member.permissions.can_send_messages:
+                        is_muted = True
+        except Exception as e:
+            logger.warning(f"Ошибка при проверке статуса пользователя {target_user.id} в Telegram: {e}")
+    
+    # Если пользователь не замучен, сообщаем об этом
+    if not is_muted:
+        username_display = get_user_mention_html(target_user)
+        await message.answer(f"ℹ️ Пользователь <b>{username_display}</b> не замучен", parse_mode=ParseMode.HTML)
+        return
+    
     try:
         # Снимаем мут (восстанавливаем все права)
         await bot.restrict_chat_member(
@@ -491,7 +524,14 @@ async def unmute_command(message: Message):
             f"<b>Модератор:</b> <i>{message.from_user.first_name or message.from_user.username or 'Неизвестно'}</i>\n\n"
             f"<blockquote>{quote}</blockquote>"
         )
-        await send_message_with_gif(message, message_text, "unmute", parse_mode=ParseMode.HTML)
+        
+        # Проверяем настройку silent mute
+        settings = await raid_protection_db.get_settings(chat_id)
+        mute_silent = settings.get('mute_silent', False)
+        
+        # Отправляем сообщение в чат только если silent mode выключен
+        if not mute_silent:
+            await send_message_with_gif(message, message_text, "unmute", parse_mode=ParseMode.HTML)
         
         # Отправляем уведомление пользователю
         try:
@@ -527,7 +567,8 @@ async def unmute_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при снятии мута пользователю {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при снятии мута")
+        error_msg = get_error_message(e, "снятия мута")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -649,7 +690,8 @@ async def kick_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при кике пользователя {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при исключении пользователя")
+        error_msg = get_error_message(e, "исключения")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -813,7 +855,8 @@ async def ban_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при бане пользователя {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при бане пользователя")
+        error_msg = get_error_message(e, "бана")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -886,6 +929,42 @@ async def unban_command(message: Message):
         await message.answer("❌ Нельзя разбанить самого себя")
         return
     
+    # Проверяем, действительно ли пользователь забанен
+    is_banned = False
+    
+    # Проверяем активные баны в базе данных
+    try:
+        active_punishments = await moderation_db.get_active_punishments(chat_id, "ban")
+        for punishment in active_punishments:
+            if punishment['user_id'] == target_user.id:
+                is_banned = True
+                break
+    except Exception as e:
+        logger.warning(f"Ошибка при проверке активных банов для пользователя {target_user.id}: {e}")
+    
+    # Проверяем статус пользователя в Telegram
+    if not is_banned:
+        try:
+            chat_member = await bot.get_chat_member(chat_id, target_user.id)
+            if chat_member.status == 'kicked':
+                is_banned = True
+        except Exception as e:
+            error_str = str(e).lower()
+            # Если пользователь не найден в чате, возможно он забанен
+            # Попробуем выполнить unban - если пользователь не забанен, получим ошибку
+            if "user not found" in error_str or "chat not found" in error_str:
+                # Пользователь может быть забанен, но мы не можем проверить через get_chat_member
+                # Попробуем выполнить unban и посмотрим на результат
+                pass
+            else:
+                logger.warning(f"Ошибка при проверке статуса пользователя {target_user.id} в Telegram: {e}")
+    
+    # Если пользователь не забанен, сообщаем об этом
+    if not is_banned:
+        username_display = get_user_mention_html(target_user)
+        await message.answer(f"ℹ️ Пользователь <b>{username_display}</b> не забанен", parse_mode=ParseMode.HTML)
+        return
+    
     try:
         await bot.unban_chat_member(chat_id=chat_id, user_id=target_user.id)
         
@@ -913,26 +992,42 @@ async def unban_command(message: Message):
             f"<b>Модератор:</b> <i>{message.from_user.first_name or message.from_user.username or 'Неизвестно'}</i>\n\n"
             f"<blockquote>{quote}</blockquote>"
         )
-        await send_message_with_gif(message, message_text, "unban", parse_mode=ParseMode.HTML)
         
-        # Уведомление в ЛС
+        # Проверяем настройку silent mute
+        settings = await raid_protection_db.get_settings(chat_id)
+        mute_silent = settings.get('mute_silent', False)
+        
+        # Отправляем сообщение в чат только если silent mode выключен
+        if not mute_silent:
+            await send_message_with_gif(message, message_text, "unban", parse_mode=ParseMode.HTML)
+        
+        # Отправляем уведомление пользователю
         try:
-            chat_info = await bot.get_chat(chat_id)
-            chat_title = chat_info.title or "Неизвестный чат"
-            
             builder = InlineKeyboardBuilder()
-            builder.button(text="💬 Открыть чат", url=f"https://t.me/{chat_info.username}" if chat_info.username else f"https://t.me/c/{str(chat_id)[4:]}")
+            
+            if message.chat.username:
+                chat_url = f"https://t.me/{message.chat.username}"
+            else:
+                chat_id_str = str(message.chat.id)
+                if chat_id_str.startswith('-100'):
+                    chat_id_str = chat_id_str[4:]
+                chat_url = f"https://t.me/c/{chat_id_str}"
+            
+            builder.add(InlineKeyboardButton(
+                text="💬 Открыть чат",
+                url=chat_url
+            ))
             
             await bot.send_message(
                 target_user.id,
-                f"✅ Вы были разбанены в чате \"{chat_title}\"\n\n"
-                f"<blockquote>{quote}</blockquote>",
+                f"✅ <b>Вы были разбанены</b>\n\n"
+                f"В чате <b>{message.chat.title}</b> с вас сняты ограничения на участие в группе.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=builder.as_markup()
             )
         except Exception as e:
             error_str = str(e).lower()
-            # Ошибка "bot can't initiate conversation" - это нормально, пользователь не писал боту или заблокировал его
+            # Ошибка "bot can't initiate conversation" - пользователь не писал боту или заблокировал его
             if "can't initiate conversation" in error_str or "forbidden" in error_str:
                 logger.debug(f"Не удалось отправить уведомление пользователю {target_user.id}: пользователь не писал боту или заблокировал его")
             else:
@@ -940,7 +1035,8 @@ async def unban_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при разбане пользователя {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при разбане пользователя")
+        error_msg = get_error_message(e, "разбана")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -1135,7 +1231,8 @@ async def warn_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при выдаче предупреждения пользователю {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при выдаче предупреждения")
+        error_msg = get_error_message(e, "выдачи предупреждения")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -1228,7 +1325,8 @@ async def unwarn_command(message: Message):
         
         success = await moderation_db.remove_warn(chat_id, target_user.id)
         if not success:
-            await message.answer("❌ Ошибка при снятии предупреждения")
+            error_msg = get_error_message(Exception("Failed to remove warn"), "снятия предупреждения")
+            await message.answer(error_msg)
             return
         
         new_warn_count = await moderation_db.get_user_warn_count(chat_id, target_user.id)
@@ -1246,7 +1344,8 @@ async def unwarn_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при снятии предупреждения пользователю {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при снятии предупреждения")
+        error_msg = get_error_message(e, "снятия предупреждения")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -1328,7 +1427,8 @@ async def warns_command(message: Message):
         
     except Exception as e:
         logger.error(f"Ошибка при получении предупреждений пользователя {target_user.id}: {e}")
-        await message.answer("❌ Ошибка при получении предупреждений")
+        error_msg = get_error_message(e, "получения предупреждений")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -1347,7 +1447,8 @@ async def ap_command(message: Message):
             return
     except Exception as e:
         logger.error(f"Ошибка при проверке прав для команды /ap: {e}")
-        await message.answer("❌ Ошибка при проверке прав")
+        error_msg = get_error_message(e, "проверки прав")
+        await message.answer(error_msg)
         return
     
     args = message.text.split()
@@ -1363,7 +1464,7 @@ async def ap_command(message: Message):
                     "Использование:\n"
                     "• <code>/ap @username 3</code>\n"
                     "• <code>/ap 3</code> (при ответе на сообщение)\n\n"
-                    "Ранги: 1-Владелец, 2-Администратор, 3-Старший модератор, 4-Младший модератор",
+                    "Ранги: 1-Совладелец, 2-Администратор, 3-Старший модератор, 4-Младший модератор",
                     parse_mode=ParseMode.HTML
                 )
             else:
@@ -1384,7 +1485,7 @@ async def ap_command(message: Message):
                     "Использование:\n"
                     "• <code>/ap @username 3</code>\n"
                     "• <code>/ap 3</code> (при ответе на сообщение)\n\n"
-                    "Ранги: 1-Владелец, 2-Администратор, 3-Старший модератор, 4-Младший модератор",
+                    "Ранги: 1-Совладелец, 2-Администратор, 3-Старший модератор, 4-Младший модератор",
                     parse_mode=ParseMode.HTML
                 )
             else:
@@ -1414,6 +1515,20 @@ async def ap_command(message: Message):
     if rank < 1 or rank > 4:
         await message.answer("❌ Ранг должен быть от 1 до 4")
         return
+    
+    # Проверяем права на назначение ранга 1 (Co-owner) - только Telegram creator может назначить
+    if rank == 1:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            if member.status != 'creator':
+                msg = await message.answer("❌ Только владелец чата может назначить совладельца")
+                asyncio.create_task(delete_message_after_delay(msg, 5))
+                return
+        except Exception as e:
+            logger.error(f"Ошибка при проверке прав для назначения ранга 1: {e}")
+            error_msg = get_error_message(e, "проверки прав")
+            await message.answer(error_msg)
+            return
     
     # Проверяем права на назначение конкретного ранга через систему прав бота
     permission_map = {
@@ -1450,7 +1565,11 @@ async def ap_command(message: Message):
     success = await db.assign_moderator(chat_id, target_user.id, rank, user_id)
     
     if success:
-        rank_name = get_rank_name(rank)
+        # Для ранга 1 показываем "Совладелец" вместо "Владелец"
+        if rank == 1:
+            rank_name = "Совладелец"
+        else:
+            rank_name = get_rank_name(rank)
         username_display = get_user_mention_html(target_user)
         
         await message.answer(
@@ -1458,7 +1577,8 @@ async def ap_command(message: Message):
             parse_mode=ParseMode.HTML
         )
     else:
-        await message.answer("❌ Ошибка при назначении ранга")
+        error_msg = get_error_message(Exception("Failed to assign rank"), "назначения ранга")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -1477,7 +1597,8 @@ async def unap_command(message: Message):
             return
     except Exception as e:
         logger.error(f"Ошибка при проверке прав для команды /unap: {e}")
-        await message.answer("❌ Ошибка при проверке прав")
+        error_msg = get_error_message(e, "проверки прав")
+        await message.answer(error_msg)
         return
     
     # Проверяем права на снятие рангов через систему прав бота
@@ -1554,7 +1675,8 @@ async def unap_command(message: Message):
             parse_mode=ParseMode.HTML
         )
     else:
-        await message.answer("❌ Ошибка при снятии ранга")
+        error_msg = get_error_message(Exception("Failed to remove rank"), "снятия ранга")
+        await message.answer(error_msg)
 
 
 @require_admin_rights
@@ -1568,25 +1690,25 @@ async def staff_command(message: Message):
     
     # Группируем модераторов по рангам
     ranks = {}
+    owner_users = []  # Telegram creator
+    co_owners = []  # Rank 1 from DB (Co-owners)
     
-    # Добавляем владельца чата
+    # Получаем Telegram creator
+    creator_id = None
     try:
         chat_admins = await bot.get_chat_administrators(chat_id)
         for admin in chat_admins:
             if admin.status == 'creator':
                 user = admin.user
                 if not user.is_bot:
-                    if RANK_OWNER not in ranks:
-                        ranks[RANK_OWNER] = []
-                    
-                    user_info = {
+                    creator_id = user.id
+                    owner_users.append({
                         'user_id': user.id,
                         'username': user.username,
                         'first_name': user.first_name,
                         'last_name': user.last_name,
                         'rank': RANK_OWNER
-                    }
-                    ranks[RANK_OWNER].append(user_info)
+                    })
                 break
     except Exception as e:
         logger.error(f"Ошибка при получении владельца чата {chat_id}: {e}")
@@ -1595,7 +1717,12 @@ async def staff_command(message: Message):
     for mod in moderators:
         rank = mod['rank']
         
+        # Rank 1 from DB: если это не Telegram creator, то это Co-owner (Совладелец)
         if rank == RANK_OWNER:
+            # Добавляем в совладельцы только если это НЕ Telegram creator
+            if creator_id is None or mod['user_id'] != creator_id:
+                co_owners.append(mod)
+            # Если это Telegram creator, он уже отображается как "Владелец", пропускаем
             continue
         
         if rank not in ranks:
@@ -1604,7 +1731,10 @@ async def staff_command(message: Message):
         if not any(existing_mod['user_id'] == mod['user_id'] for existing_mod in ranks[rank]):
             ranks[rank].append(mod)
     
-    if not ranks:
+    # Проверяем, есть ли кто-то для отображения
+    has_anyone = owner_users or co_owners or ranks
+    
+    if not has_anyone:
         await send_message_with_gif(
             message,
             "👥 <b>Модераторы чата</b>\n\n• Модераторы не назначены",
@@ -1623,6 +1753,24 @@ async def staff_command(message: Message):
         4: "🔰"
     }
     
+    # Сначала показываем владельца (Telegram creator)
+    if owner_users:
+        staff_text += f"👑 <b>Владелец:</b>\n"
+        for owner in owner_users:
+            user_display = get_user_mention_html(owner)
+            staff_text += f"• {user_display}\n"
+        staff_text += "\n"
+    
+    # Затем показываем совладельцев (rank 1 from DB)
+    if co_owners:
+        co_owner_name = "Совладелец" if len(co_owners) == 1 else "Совладельцы"
+        staff_text += f"👑 <b>{co_owner_name}:</b>\n"
+        for co_owner in co_owners:
+            user_display = get_user_mention_html(co_owner)
+            staff_text += f"• {user_display}\n"
+        staff_text += "\n"
+    
+    # Затем показываем остальные ранги (2, 3, 4)
     for rank in sorted(ranks.keys()):
         mods = ranks[rank]
         rank_name = get_rank_name(rank, len(mods))

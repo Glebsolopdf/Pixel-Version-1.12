@@ -148,6 +148,7 @@ def register_settings_handlers(dispatcher: Dispatcher, bot_instance: Bot):
     dp.callback_query.register(utilities_reaction_spam_punishment_set_callback, F.data.startswith("utilities_reaction_punishment_"))
     dp.callback_query.register(utilities_reaction_spam_ban_duration_callback, F.data == "utilities_reaction_spam_ban_duration")
     dp.callback_query.register(utilities_reaction_spam_ban_duration_set_callback, F.data.startswith("utilities_reaction_ban_duration_"))
+    dp.callback_query.register(utilities_reaction_spam_silent_callback, F.data == "utilities_reaction_spam_silent")
     dp.callback_query.register(utilities_fake_commands_callback, F.data == "utilities_fake_commands")
     dp.callback_query.register(utilities_fake_commands_toggle_callback, F.data == "utilities_fake_commands_toggle")
     dp.callback_query.register(utilities_back_callback, F.data == "utilities_back")
@@ -267,11 +268,18 @@ async def selfdemote_command(message: Message):
     """Само-снятие с модераторского поста"""
     chat_id = message.chat.id
     user_id = message.from_user.id
-    effective_rank = await get_effective_rank(chat_id, user_id)
     
-    if effective_rank == RANK_OWNER:
-        await message.answer("😑 Вы не можете снять себя этой командой.")
-        return
+    # Проверяем, является ли пользователь реальным Telegram creator (владельцем)
+    # Совладельцы (rank 1 из БД) могут снимать себя, только настоящий владелец не может
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status == 'creator':
+            await message.answer("😑 Вы не можете снять себя этой командой.")
+            return
+    except Exception as e:
+        logger.error(f"Ошибка при проверке статуса пользователя {user_id} в чате {chat_id}: {e}")
+    
+    effective_rank = await get_effective_rank(chat_id, user_id)
     if effective_rank > RANK_JUNIOR_MOD:
         await message.answer("🙂‍↔️ У вас нет модераторского поста.")
         return
@@ -303,10 +311,17 @@ async def selfdemote_confirm_callback(callback: CallbackQuery):
             await callback.answer("Эта кнопка не для вас.", show_alert=True)
             return
 
+        # Проверяем, является ли пользователь реальным Telegram creator (владельцем)
+        # Совладельцы (rank 1 из БД) могут снимать себя, только настоящий владелец не может
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            if member.status == 'creator':
+                await callback.answer("Владелец не может снять себя этой кнопкой.", show_alert=True)
+                return
+        except Exception as e:
+            logger.error(f"Ошибка при проверке статуса пользователя {user_id} в чате {chat_id}: {e}")
+        
         effective_rank = await get_effective_rank(chat_id, user_id)
-        if effective_rank == RANK_OWNER:
-            await callback.answer("Владелец не может снять себя этой кнопкой.", show_alert=True)
-            return
         if effective_rank > RANK_JUNIOR_MOD:
             await callback.answer("У вас нет модераторского поста.", show_alert=True)
             return
@@ -707,7 +722,6 @@ async def rules_command(message: Message):
     
     command_text = message.text or ""
     logger.debug(f"Исходный command_text: '{command_text}'")
-    
     match = re.match(r'^/rules(@\w+)?\s*(.*)$', command_text, re.IGNORECASE | re.DOTALL)
     if match:
         command_text = match.group(2)  # Извлекаем только аргументы (все после команды), сохраняя форматирование
@@ -2074,6 +2088,7 @@ async def utilities_reaction_spam_callback(callback: CallbackQuery):
     warning_enabled = settings.get('reaction_spam_warning_enabled', True)
     punishment = settings.get('reaction_spam_punishment', 'kick')
     ban_duration = settings.get('reaction_spam_ban_duration', 300)
+    reaction_spam_silent = settings.get('reaction_spam_silent', False)
     
     builder = InlineKeyboardBuilder()
     
@@ -2090,15 +2105,20 @@ async def utilities_reaction_spam_callback(callback: CallbackQuery):
     builder.button(text="⚡ Наказание", callback_data="utilities_reaction_spam_punishment")
     if punishment == 'ban':
         builder.button(text="⏱ Время бана", callback_data="utilities_reaction_spam_ban_duration")
+    builder.button(
+        text=f"{'✅' if reaction_spam_silent else '❌'} Наказание без уведомлений",
+        callback_data="utilities_reaction_spam_silent"
+    )
     builder.button(text="🔙 Назад", callback_data="utilities_back")
     
-    builder.adjust(1, 1, 1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1, 1, 1)
     
     window_min = window // 60
     window_text = f"{window_min} мин" if window_min > 0 else f"{window} сек"
     
     ban_duration_text = format_mute_duration(ban_duration)
     punishment_text = "Кик" if punishment == 'kick' else f"Бан ({ban_duration_text})"
+    reaction_spam_silent_text = "✅ Включен" if reaction_spam_silent else "❌ Выключен"
     
     text = (
         "🔧 <b>Спам реакциями</b>\n\n"
@@ -2106,7 +2126,8 @@ async def utilities_reaction_spam_callback(callback: CallbackQuery):
         f"<b>Лимит:</b> {limit} реакций\n"
         f"<b>Временное окно:</b> {window_text}\n"
         f"<b>Предупреждение:</b> {'✅ Включено' if warning_enabled else '❌ Выключено'}\n"
-        f"<b>Наказание:</b> {punishment_text}\n\n"
+        f"<b>Наказание:</b> {punishment_text}\n"
+        f"<b>Наказание без уведомлений:</b> {reaction_spam_silent_text}\n\n"
         "Бот будет отслеживать избыточные реакции на сообщения и применять наказания."
     )
     
@@ -2321,6 +2342,21 @@ async def utilities_reaction_spam_ban_duration_callback(callback: CallbackQuery)
     
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
     await callback.answer()
+
+
+async def utilities_reaction_spam_silent_callback(callback: CallbackQuery):
+    """Переключить наказание без уведомлений для реакций"""
+    if not await _ensure_admin(callback):
+        return
+    
+    chat_id = callback.message.chat.id
+    settings = await utilities_db.get_settings(chat_id)
+    
+    current_silent = settings.get('reaction_spam_silent', False)
+    new_silent = not current_silent
+    
+    await utilities_db.update_setting(chat_id, 'reaction_spam_silent', new_silent)
+    await utilities_reaction_spam_callback(callback)
 
 
 async def utilities_reaction_spam_ban_duration_set_callback(callback: CallbackQuery):
