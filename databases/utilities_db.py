@@ -57,6 +57,14 @@ class UtilitiesDatabase:
                     # Колонка уже существует
                     pass
                 
+                # Добавляем колонку reaction_spam_silent если её нет
+                try:
+                    db.execute("ALTER TABLE utilities_settings ADD COLUMN reaction_spam_silent BOOLEAN DEFAULT 0")
+                    db.commit()
+                except sqlite3.OperationalError:
+                    # Колонка уже существует
+                    pass
+                
                 # Таблица для отслеживания реакций пользователей
                 db.execute("""
                     CREATE TABLE IF NOT EXISTS reaction_activity (
@@ -122,14 +130,29 @@ class UtilitiesDatabase:
         def _get_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:
-                    cursor = db.execute("""
-                        SELECT emoji_spam_enabled, emoji_spam_limit,
-                               reaction_spam_enabled, reaction_spam_limit,
-                               reaction_spam_window, reaction_spam_warning_enabled,
-                               reaction_spam_punishment, reaction_spam_ban_duration,
-                               fake_commands_enabled
-                        FROM utilities_settings WHERE chat_id = ?
-                    """, (chat_id,))
+                    # Проверяем наличие reaction_spam_silent в схеме
+                    cursor_columns = db.execute("PRAGMA table_info(utilities_settings)")
+                    columns = [col[1] for col in cursor_columns.fetchall()]
+                    has_silent = 'reaction_spam_silent' in columns
+                    
+                    if has_silent:
+                        cursor = db.execute("""
+                            SELECT emoji_spam_enabled, emoji_spam_limit,
+                                   reaction_spam_enabled, reaction_spam_limit,
+                                   reaction_spam_window, reaction_spam_warning_enabled,
+                                   reaction_spam_punishment, reaction_spam_ban_duration,
+                                   fake_commands_enabled, reaction_spam_silent
+                            FROM utilities_settings WHERE chat_id = ?
+                        """, (chat_id,))
+                    else:
+                        cursor = db.execute("""
+                            SELECT emoji_spam_enabled, emoji_spam_limit,
+                                   reaction_spam_enabled, reaction_spam_limit,
+                                   reaction_spam_window, reaction_spam_warning_enabled,
+                                   reaction_spam_punishment, reaction_spam_ban_duration,
+                                   fake_commands_enabled
+                            FROM utilities_settings WHERE chat_id = ?
+                        """, (chat_id,))
                     row = cursor.fetchone()
                     
                     if row:
@@ -142,7 +165,8 @@ class UtilitiesDatabase:
                             'reaction_spam_warning_enabled': bool(row[5]),
                             'reaction_spam_punishment': row[6],
                             'reaction_spam_ban_duration': row[7],
-                            'fake_commands_enabled': bool(row[8]) if len(row) > 8 else False
+                            'fake_commands_enabled': bool(row[8]) if len(row) > 8 else False,
+                            'reaction_spam_silent': bool(row[9]) if has_silent and len(row) > 9 else False
                         }
                     else:
                         # Возвращаем настройки по умолчанию
@@ -155,7 +179,8 @@ class UtilitiesDatabase:
                             'reaction_spam_warning_enabled': True,
                             'reaction_spam_punishment': 'kick',
                             'reaction_spam_ban_duration': 300,
-                            'fake_commands_enabled': False
+                            'fake_commands_enabled': False,
+                            'reaction_spam_silent': False
                         }
             except Exception as e:
                 logger.error(f"Ошибка при получении настроек утилит для чата {chat_id}: {e}")
@@ -168,7 +193,8 @@ class UtilitiesDatabase:
                     'reaction_spam_warning_enabled': True,
                     'reaction_spam_punishment': 'kick',
                     'reaction_spam_ban_duration': 3600,
-                    'fake_commands_enabled': False
+                    'fake_commands_enabled': False,
+                    'reaction_spam_silent': False
                 }
         
         return await asyncio.get_event_loop().run_in_executor(None, _get_sync)
@@ -202,7 +228,8 @@ class UtilitiesDatabase:
                             'reaction_spam_warning_enabled': 1,
                             'reaction_spam_punishment': 'kick',
                             'reaction_spam_ban_duration': 300,
-                            'fake_commands_enabled': 0
+                            'fake_commands_enabled': 0,
+                            'reaction_spam_silent': 0
                         }
                         defaults[setting_name] = db_value
                         
@@ -254,7 +281,8 @@ class UtilitiesDatabase:
                             'reaction_spam_warning_enabled': 1,
                             'reaction_spam_punishment': 'kick',
                             'reaction_spam_ban_duration': 300,
-                            'fake_commands_enabled': 0
+                            'fake_commands_enabled': 0,
+                            'reaction_spam_silent': 0
                         }
                         
                         # Применяем переданные kwargs к дефолтным значениям
