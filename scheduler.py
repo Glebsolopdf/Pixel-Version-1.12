@@ -194,23 +194,32 @@ class TaskScheduler:
                                             continue
                                         
                                         if time_diff >= 0:
+                                            # Двойная проверка: если уже в recently_processed_ref, пропускаем
+                                            # (защита от race condition между первой проверкой и этой)
+                                            if mute_id in recently_processed_ref:
+                                                time_since = current_time_ref - recently_processed_ref[mute_id]
+                                                if time_since < 5:  # Очень недавно обработан
+                                                    logger.debug(f"Мут {mute_id} уже обрабатывается (race condition защита), пропускаем")
+                                                    continue
+                                            
+                                            # Отмечаем что обрабатываем этот мут до попытки деактивации
+                                            recently_processed_ref[mute_id] = current_time_ref
+                                            
                                             deactivated = await moderation_db.deactivate_punishment(mute_id)
                                             
                                             if not deactivated:
                                                 logger.debug(f"Мут {mute_id} уже был обработан другим потоком, пропускаем")
-                                                recently_processed_ref[mute_id] = current_time_ref
                                                 continue
-                                            
-                                            recently_processed_ref[mute_id] = current_time_ref
                                             
                                             logger.info(f"Мут истек для пользователя {mute['user_id']} в чате {chat['chat_id']}")
                                             
                                             import bot
+                                            from aiogram.types import ChatPermissions
                                             try:
                                                 await bot.bot.restrict_chat_member(
                                                     chat_id=chat['chat_id'],
                                                     user_id=mute['user_id'],
-                                                    permissions=bot.types.ChatPermissions(
+                                                    permissions=ChatPermissions(
                                                         can_send_messages=True,
                                                         can_send_media_messages=True,
                                                         can_send_polls=True,
@@ -256,26 +265,35 @@ class TaskScheduler:
                                             import random
                                             quote = random.choice(philosophical_quotes)
                                             
-                                            try:
-                                                await bot.bot.send_message(
-                                                    chat['chat_id'],
-                                                    f"🔊 Участник <b>{username_display}</b> <i>освобожден(а) от тайм-аута</i>\n"
-                                                    f"🔸 <b>По истечению времени я автоматически снял ограничения, не нарушайте правила чата!</b>\n\n"
-                                                    f"<blockquote>{quote}</blockquote>",
-                                                    parse_mode=ParseMode.HTML
-                                                )
-                                                logger.info(f"✅ Автоматически снят мут пользователю {mute['user_id']} в чате {chat['chat_id']}")
-                                            except Exception as e:
-                                                error_str = str(e).lower()
-                                                if "chat not found" in error_str or "bad request" in error_str:
-                                                    if DEBUG:
-                                                        logger.debug(f"Чат {chat['chat_id']} не найден при отправке сообщения о размуте: {e}")
-                                                    try:
-                                                        await db.deactivate_chat(chat['chat_id'])
-                                                    except Exception:
-                                                        pass
-                                                else:
-                                                    logger.error(f"Ошибка при отправке сообщения о размуте: {e}")
+                                            # Проверяем настройку silent mute
+                                            raid_protection_db = get_raid_protection_db()
+                                            settings = await raid_protection_db.get_settings(chat['chat_id'])
+                                            mute_silent = settings.get('mute_silent', False)
+                                            
+                                            # Отправляем сообщение в чат только если silent mode выключен
+                                            if not mute_silent:
+                                                try:
+                                                    await bot.bot.send_message(
+                                                        chat['chat_id'],
+                                                        f"🔊 Участник <b>{username_display}</b> <i>освобожден(а) от тайм-аута</i>\n"
+                                                        f"🔸 <b>По истечению времени я автоматически снял ограничения, не нарушайте правила чата!</b>\n\n"
+                                                        f"<blockquote>{quote}</blockquote>",
+                                                        parse_mode=ParseMode.HTML
+                                                    )
+                                                    logger.info(f"✅ Автоматически снят мут пользователю {mute['user_id']} в чате {chat['chat_id']}")
+                                                except Exception as e:
+                                                    error_str = str(e).lower()
+                                                    if "chat not found" in error_str or "bad request" in error_str:
+                                                        if DEBUG:
+                                                            logger.debug(f"Чат {chat['chat_id']} не найден при отправке сообщения о размуте: {e}")
+                                                        try:
+                                                            await db.deactivate_chat(chat['chat_id'])
+                                                        except Exception:
+                                                            pass
+                                                    else:
+                                                        logger.error(f"Ошибка при отправке сообщения о размуте: {e}")
+                                            else:
+                                                logger.info(f"✅ Автоматически снят мут пользователю {mute['user_id']} в чате {chat['chat_id']} (silent mode)")
                                             
                                             expired_count += 1
                                             
