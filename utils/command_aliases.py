@@ -44,7 +44,7 @@ COMMAND_ALIASES = {
 }
 
 # Специальные алиасы, не входящие в основной словарь
-SPECIAL_ALIASES = {"кто я": "myprofile_self", "снять меня": "selfdemote"}
+SPECIAL_ALIASES = {"кто я": "myprofile_self", "снять меня": "selfdemote", "снять себя": "selfdemote"}
 
 
 def _resolve_alias(text: str) -> str | None:
