@@ -221,13 +221,19 @@ class TaskScheduler:
                                                     user_id=mute['user_id'],
                                                     permissions=ChatPermissions(
                                                         can_send_messages=True,
-                                                        can_send_media_messages=True,
+                                                        can_send_audios=True,
+                                                        can_send_documents=True,
+                                                        can_send_photos=True,
+                                                        can_send_videos=True,
+                                                        can_send_video_notes=True,
+                                                        can_send_voice_notes=True,
                                                         can_send_polls=True,
                                                         can_send_other_messages=True,
                                                         can_add_web_page_previews=True,
-                                                        can_change_info=False,
-                                                        can_invite_users=False,
-                                                        can_pin_messages=False
+                                                        can_change_info=True,
+                                                        can_invite_users=True,
+                                                        can_pin_messages=True,
+                                                        can_manage_topics=True
                                                     )
                                                 )
                                             except Exception as e:
@@ -503,21 +509,23 @@ class TaskScheduler:
         """Задача очистки старых записей модерации"""
         logger.info("Задача автоматической очистки старых записей модерации запущена")
         
-        await asyncio.sleep(3600)
+        # Небольшая задержка перед первым запуском
+        await asyncio.sleep(10)
         
         while self.running:
             try:
-                success = await moderation_db.cleanup_old_records(days_to_keep=180)
+                logger.info("Запуск очистки старых записей модерации...")
+                success = await moderation_db.cleanup_old_records(days_to_keep=7)
                 if success:
                     logger.info("Автоматическая очистка старых записей модерации завершена")
                 else:
                     logger.warning("Ошибка при автоматической очистке старых записей модерации")
                 
-                await asyncio.sleep(604800)
+                await asyncio.sleep(3600)
                 
             except Exception as e:
-                logger.error(f"Ошибка в задаче автоматической очистки старых записей модерации: {e}")
-                await asyncio.sleep(21600)
+                logger.error(f"Ошибка в задаче автоматической очистки старых записей модерации: {e}", exc_info=True)
+                await asyncio.sleep(20)
     
     async def reputation_recovery_task(self):
         """Задача восстановления репутации: +1 каждые 4 часа, +2 по выходным (МСК)"""
@@ -566,7 +574,7 @@ class TaskScheduler:
         
         while self.running:
             try:
-                deleted_count = await reputation_db.cleanup_old_punishments(days=3)
+                deleted_count = await reputation_db.cleanup_old_punishments(days=7)
                 
                 if deleted_count > 0:
                     logger.info(f"Очищено {deleted_count} старых наказаний из базы репутации")

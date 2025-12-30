@@ -43,11 +43,13 @@ from utils.notifications import (
 from utils.permissions import set_bot_instance as set_permissions_bot
 from middleware.settings_guard import SettingsGuardMiddleware
 from middleware.command_spam import CommandSpamMiddleware
+from middleware.auto_spam_detection import AutoSpamDetectionMiddleware
 from handlers.common import register_common_handlers
 from handlers.private import register_private_handlers
 from handlers.moderation import register_moderation_handlers
 from handlers.settings import register_settings_handlers
 from handlers.profile import register_profile_handlers
+from handlers.userinfo import register_userinfo_handlers
 from handlers.network import register_network_handlers
 from handlers.raid_protection import register_raid_protection_handlers
 from handlers.timezone import register_timezone_handlers
@@ -77,6 +79,7 @@ set_notifications_bot(bot)
 set_permissions_bot(bot)
 
 dp.callback_query.middleware(SettingsGuardMiddleware())
+dp.message.outer_middleware(AutoSpamDetectionMiddleware())
 dp.message.outer_middleware(CommandSpamMiddleware())
 
 register_common_handlers(dp, bot)
@@ -84,6 +87,7 @@ register_private_handlers(dp, bot)
 register_moderation_handlers(dp, bot)
 register_settings_handlers(dp, bot)
 register_profile_handlers(dp, bot)
+register_userinfo_handlers(dp, bot)
 register_network_handlers(dp, bot)
 register_raid_protection_handlers(dp, bot)
 register_timezone_handlers(dp, bot)
