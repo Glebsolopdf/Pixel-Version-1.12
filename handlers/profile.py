@@ -13,6 +13,7 @@ from aiogram.enums import ParseMode
 
 from databases.database import db
 from databases.reputation_db import reputation_db
+from databases.moderation_db import moderation_db
 from databases.timezone_db import TimezoneDatabase
 from config import TIMEZONE_DB_PATH
 from utils.permissions import get_effective_rank
@@ -274,6 +275,26 @@ async def myprofile_command(message: Message):
         await message.answer("📊 Команда профиля отключена для этого чата")
         return
     
+    # Проверяем, является ли пользователь ботом
+    if target_user.is_bot:
+        # Показываем упрощенную информацию о боте
+        bot_info_lines = []
+        
+        # Получаем mention бота
+        user_name = get_user_mention_html(target_user)
+        bot_info_lines.append(f"🤖 Это бот: {user_name}")
+        bot_info_lines.append("")
+        
+        # Основная информация из Telegram API
+        bot_info_lines.append(f"🆔 ID: <code>{target_user.id}</code>")
+        
+        if target_user.username:
+            bot_info_lines.append(f"📝 Username: @{target_user.username}")
+        
+        bot_info_text = "\n".join(bot_info_lines)
+        await message.answer(bot_info_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    
     await db.ensure_user_first_seen(chat_id, target_user.id)
 
     first_seen = await db.get_user_first_seen(chat_id, target_user.id)
@@ -332,6 +353,11 @@ async def myprofile_command(message: Message):
         reputation = await reputation_db.get_user_reputation(target_user.id)
         reputation_emoji = get_reputation_emoji(reputation)
         caption_lines.append(f"Репутация: {reputation}/100 {reputation_emoji}")
+        
+        # Добавляем информацию о варнах, если они есть
+        warn_count = await moderation_db.get_user_warn_count(chat_id, target_user.id)
+        if warn_count > 0:
+            caption_lines.append(f"⚠️ Варны: {warn_count}")
 
         caption = "\n".join(caption_lines)
 
@@ -598,8 +624,8 @@ async def reputation_command(message: Message):
         reputation_emoji = get_reputation_emoji(reputation)
         progress_bar = get_reputation_progress_bar(reputation)
         
-        stats = await reputation_db.get_recent_punishment_stats(target_user.id, days=3)
-        recent_punishments = await reputation_db.get_recent_punishments(target_user.id, days=3)
+        stats = await reputation_db.get_recent_punishment_stats(target_user.id, days=7)
+        recent_punishments = await reputation_db.get_recent_punishments(target_user.id, days=7)
         
         username_display = get_user_mention_html(target_user)
         
@@ -608,7 +634,12 @@ async def reputation_command(message: Message):
         
         message_text += f"👤 <b>Пользователь:</b> {username_display}\n\n"
         
-        message_text += "📋 <b>Наказания (последние 3 дня):</b>\n"
+        # Добавляем информацию об активных варнах
+        active_warn_count = await moderation_db.get_user_warn_count(chat_id, target_user.id)
+        if active_warn_count > 0:
+            message_text += f"⚠️ <b>Активные варны:</b> {active_warn_count}\n\n"
+        
+        message_text += "📋 <b>Наказания (последние 7 дней):</b>\n"
         message_text += f"⚠️ Варны: {stats['warn']}\n"
         message_text += f"🔇 Муты: {stats['mute']}\n"
         message_text += f"💨 Кики: {stats['kick']}\n"

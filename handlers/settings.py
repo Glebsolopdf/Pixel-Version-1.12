@@ -116,6 +116,7 @@ def register_settings_handlers(dispatcher: Dispatcher, bot_instance: Bot):
     dp.callback_query.register(statconfig_toggle_stats_callback, F.data == "statconfig_toggle_stats")
     dp.callback_query.register(statconfig_toggle_media_callback, F.data == "statconfig_toggle_media")
     dp.callback_query.register(statconfig_toggle_profile_callback, F.data == "statconfig_toggle_profile")
+    dp.callback_query.register(statconfig_toggle_userinfo_callback, F.data == "statconfig_toggle_userinfo")
     
     dp.callback_query.register(settings_open_ranks_callback, F.data == "settings_open_ranks")
     dp.callback_query.register(rankconfig_select_callback, F.data.startswith("rankconfig_select_"))
@@ -161,7 +162,7 @@ async def build_settings_menu(chat_id: int, effective_rank: int):
     """Построить главное меню настроек"""
     builder = InlineKeyboardBuilder()
     
-    builder.button(text="📊 Статистика", callback_data="settings_open_stat")
+    builder.button(text="📊 Общие команды", callback_data="settings_open_stat")
     builder.button(text="⚠️ Варны", callback_data="settings_open_warn")
     builder.button(text="🔰 Права/ранги", callback_data="settings_open_ranks")
     builder.button(text="🇷🇺 Префикс", callback_data="settings_open_ruprefix")
@@ -1218,11 +1219,14 @@ async def settings_open_stat_callback(callback: CallbackQuery):
         builder.button(text=f"{media_icon} Считать медиа", callback_data="statconfig_toggle_media")
         profile_icon = "✅" if stat_settings.get('profile_enabled', True) else "❌"
         builder.button(text=f"{profile_icon} Команда профиля", callback_data="statconfig_toggle_profile")
+        userinfo_icon = "✅" if stat_settings.get('userinfo_enabled', True) else "❌"
+        builder.button(text=f"{userinfo_icon} Команда userinfo", callback_data="statconfig_toggle_userinfo")
         builder.adjust(1)
         builder.button(text="🔙 Назад", callback_data="settings_main")
 
-        message_text = "📊 <b>Настройки статистики</b>\n\n"
-        message_text += f"Статистика: {'✅ включена' if stat_settings['stats_enabled'] else '❌ отключена'}\n\n"
+        message_text = "📊 <b>Общие команды</b>\n\n"
+        message_text += f"Статистика: {'✅ включена' if stat_settings['stats_enabled'] else '❌ отключена'}\n"
+        message_text += f"Userinfo: {'✅ включена' if stat_settings.get('userinfo_enabled', True) else '❌ отключена'}\n\n"
         message_text += "Выберите настройку:"
 
         await callback.message.edit_text(message_text, parse_mode=ParseMode.HTML)
@@ -1275,6 +1279,21 @@ async def statconfig_toggle_profile_callback(callback: CallbackQuery):
         await settings_open_stat_callback(callback)
     except Exception as e:
         logger.error(f"Ошибка statconfig_toggle_profile: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+
+async def statconfig_toggle_userinfo_callback(callback: CallbackQuery):
+    """Переключить команду userinfo"""
+    if not await _ensure_admin(callback):
+        return
+    chat_id = callback.message.chat.id
+    try:
+        stat_settings = await db.get_chat_stat_settings(chat_id)
+        new_value = not stat_settings.get('userinfo_enabled', True)
+        await db.set_chat_stats_userinfo_enabled(chat_id, new_value)
+        await settings_open_stat_callback(callback)
+    except Exception as e:
+        logger.error(f"Ошибка statconfig_toggle_userinfo: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
 
 
@@ -1450,10 +1469,11 @@ async def show_rank_permissions(message, chat_id, rank, from_settings: bool = No
         if from_settings is None:
             from_settings = _is_rank_settings_context(chat_id, message.message_id)
 
-        permissions = await db.get_all_rank_permissions(chat_id, rank)
-        
-        if not permissions:
-            permissions = DEFAULT_RANK_PERMISSIONS.get(rank, {})
+        # Получаем права из БД и объединяем с дефолтными
+        db_permissions = await db.get_all_rank_permissions(chat_id, rank)
+        default_permissions = DEFAULT_RANK_PERMISSIONS.get(rank, {})
+        # Используем дефолтные права как основу и перезаписываем значениями из БД
+        permissions = {**default_permissions, **db_permissions}
         
         rank_name = get_rank_name(rank)
         emoji = "👑" if rank == 1 else "⚜️" if rank == 2 else "🛡" if rank == 3 else "🔰"
@@ -1492,7 +1512,9 @@ async def show_rank_permissions(message, chat_id, rank, from_settings: bool = No
         # Команды
         message_text += "<b>Команды:</b>\n"
         manage_rules_icon = "✅" if permissions.get('can_manage_rules', False) else "❌"
-        message_text += f"{manage_rules_icon} Управление правилами"
+        punishhistory_icon = "✅" if permissions.get('can_view_punishhistory', False) else "❌"
+        message_text += f"{manage_rules_icon} Управление правилами\n"
+        message_text += f"{punishhistory_icon} История наказаний"
         
         builder = InlineKeyboardBuilder()
         
@@ -1536,10 +1558,11 @@ async def show_rank_category_permissions(message, chat_id, rank, category, from_
         if from_settings is None:
             from_settings = _is_rank_settings_context(chat_id, message.message_id)
 
-        permissions = await db.get_all_rank_permissions(chat_id, rank)
-        
-        if not permissions:
-            permissions = DEFAULT_RANK_PERMISSIONS.get(rank, {})
+        # Получаем права из БД и объединяем с дефолтными
+        db_permissions = await db.get_all_rank_permissions(chat_id, rank)
+        default_permissions = DEFAULT_RANK_PERMISSIONS.get(rank, {})
+        # Используем дефолтные права как основу и перезаписываем значениями из БД
+        permissions = {**default_permissions, **db_permissions}
         
         rank_name = get_rank_name(rank)
         emoji = "👑" if rank == 1 else "⚜️" if rank == 2 else "🛡" if rank == 3 else "🔰"
@@ -1610,7 +1633,8 @@ async def show_rank_category_permissions(message, chat_id, rank, category, from_
             builder = InlineKeyboardBuilder()
             
             commands_perms = [
-                ('can_manage_rules', 'Управление правилами')
+                ('can_manage_rules', 'Управление правилами'),
+                ('can_view_punishhistory', 'История наказаний')
             ]
             
             for perm_type, perm_name in commands_perms:
@@ -1706,10 +1730,10 @@ async def rankconfig_toggle_callback(callback: CallbackQuery):
             category = "assignment"
         elif permission in ['can_config_warns', 'can_config_ranks']:
             category = "config"
-        elif permission in ['can_manage_rules']:
+        elif permission in ['can_manage_rules', 'can_view_punishhistory']:
             category = "commands"
         
-        if permission != 'can_view_stats':
+        if permission not in ['can_view_stats', 'can_view_punishhistory']:
             await show_rank_category_permissions(callback.message, chat_id, rank, category)
         else:
             await show_rank_permissions(callback.message, chat_id, rank)
@@ -1722,7 +1746,8 @@ async def rankconfig_toggle_callback(callback: CallbackQuery):
             'can_assign_rank_2': 'Администраторы', 'can_remove_rank': 'Снятие рангов',
             'can_config_warns': 'Настройки варнов', 'can_config_ranks': 'Настройки рангов',
             'can_manage_rules': 'Управление правилами',
-            'can_view_stats': 'Просмотр статистики'
+            'can_view_stats': 'Просмотр статистики',
+            'can_view_punishhistory': 'История наказаний'
         }
         
         perm_name = perm_name_map.get(permission, permission)

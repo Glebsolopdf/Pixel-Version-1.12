@@ -9,7 +9,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ChatPermissions, InlineKeyboardButton
+from aiogram.types import Message, ChatPermissions, InlineKeyboardButton, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 
@@ -61,6 +61,12 @@ def register_moderation_handlers(dispatcher: Dispatcher, bot_instance: Bot):
     dp.message.register(ap_command, Command("ap"))
     dp.message.register(unap_command, Command("unap"))
     dp.message.register(staff_command, Command("staff"))
+    dp.message.register(punishhistory_command, Command("punishhistory", "История наказаний"))
+    
+    # Регистрируем callback обработчики для панели истории наказаний
+    dp.callback_query.register(punishhistory_page_callback, F.data.startswith("punishhistory_page_"))
+    dp.callback_query.register(punishhistory_refresh_callback, F.data.startswith("punishhistory_refresh_"))
+    dp.callback_query.register(punishhistory_noop_callback, F.data == "punishhistory_noop")
 
 
 @require_admin_rights
@@ -474,19 +480,27 @@ async def unmute_command(message: Message):
         return
     
     try:
-        # Снимаем мут (восстанавливаем все права)
+        # Снимаем мут (восстанавливаем дефолтные права чата)
+        # Используем ChatPermissions() без параметров для дефолтных прав
+        # Это уберет пользователя из списка исключений и вернет к стандартным правам участника
         await bot.restrict_chat_member(
             chat_id=chat_id,
             user_id=target_user.id,
-            permissions=types.ChatPermissions(
+            permissions=ChatPermissions(
                 can_send_messages=True,
-                can_send_media_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
                 can_send_polls=True,
                 can_send_other_messages=True,
                 can_add_web_page_previews=True,
-                can_change_info=False,
-                can_invite_users=False,
-                can_pin_messages=False
+                can_change_info=True,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_manage_topics=True
             )
         )
         
@@ -671,6 +685,23 @@ async def kick_command(message: Message):
         # Восстанавливаем мут если он был активен (муты не удаляются из БД при кике)
         if has_active_mutes:
             await restore_user_mutes(chat_id, target_user.id)
+        
+        # Сохраняем кик в базу данных
+        await moderation_db.add_punishment(
+            chat_id=chat_id,
+            user_id=target_user.id,
+            moderator_id=user_id,
+            punishment_type="kick",
+            reason=reason,
+            duration_seconds=None,
+            expiry_date=None,
+            user_username=target_user.username,
+            user_first_name=target_user.first_name,
+            user_last_name=target_user.last_name,
+            moderator_username=message.from_user.username,
+            moderator_first_name=message.from_user.first_name,
+            moderator_last_name=message.from_user.last_name
+        )
         
         # Обновляем репутацию
         penalty = reputation_db.calculate_reputation_penalty('kick')
@@ -1785,5 +1816,370 @@ async def staff_command(message: Message):
         staff_text += "\n"
     
     await send_message_with_gif(message, staff_text, "moderatorslist", parse_mode=ParseMode.HTML)
+
+
+async def verify_punishment_status(chat_id: int, user_id: int, punishment_type: str) -> Optional[bool]:
+    """
+    Проверяет фактический статус наказания в Telegram API
+    
+    Args:
+        chat_id: ID чата
+        user_id: ID пользователя
+        punishment_type: Тип наказания ('ban' или 'mute')
+    
+    Returns:
+        True если действительно активно, False если не активно, None если не удалось проверить
+    """
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        
+        if punishment_type == 'ban':
+            # Для бана проверяем статус 'kicked' (забанен)
+            return member.status == 'kicked'
+        elif punishment_type == 'mute':
+            # Для мута проверяем права на отправку сообщений
+            if hasattr(member, 'permissions') and member.permissions:
+                return not member.permissions.can_send_messages
+            # Если нет permissions, значит пользователь не в чате или это старый API
+            return None
+        else:
+            return None
+    except Exception as e:
+        logger.debug(f"Не удалось проверить статус наказания для пользователя {user_id} в чате {chat_id}: {e}")
+        return None
+
+
+def format_punishment_entry(punishment: dict, verified_status: Optional[bool] = None) -> str:
+    """
+    Форматирует запись о наказании для отображения
+    
+    Args:
+        punishment: Словарь с данными о наказании
+        verified_status: Результат проверки через Telegram API (True/False/None)
+    
+    Returns:
+        Отформатированная строка
+    """
+    # Эмодзи для типов наказаний
+    type_emojis = {
+        'ban': '🔴',
+        'mute': '🔇',
+        'warn': '⚠️',
+        'kick': '👢'
+    }
+    
+    type_names = {
+        'ban': 'Ban',
+        'mute': 'Mute',
+        'warn': 'Warn',
+        'kick': 'Kick'
+    }
+    
+    emoji = type_emojis.get(punishment['punishment_type'], '⚙️')
+    type_name = type_names.get(punishment['punishment_type'], punishment['punishment_type'])
+    
+    # Формируем упоминание пользователя (HTML)
+    user_id = punishment.get('user_id')
+    user_name = punishment.get('user_username')
+    first_name = punishment.get('user_first_name', '') or ''
+    last_name = punishment.get('user_last_name', '') or ''
+    
+    # Убираем "None" из имени
+    if first_name == 'None':
+        first_name = ''
+    if last_name == 'None':
+        last_name = ''
+    
+    if user_name:
+        user_display = f"<a href='tg://user?id={user_id}'>@{user_name}</a>"
+    elif first_name or last_name:
+        display_name = f"{first_name} {last_name}".strip()
+        user_display = f"<a href='tg://user?id={user_id}'>{display_name}</a>"
+    else:
+        user_display = f"<a href='tg://user?id={user_id}'>ID{user_id}</a>"
+    
+    # Формируем упоминание модератора (HTML)
+    mod_id = punishment.get('moderator_id')
+    mod_username = punishment.get('moderator_username')
+    mod_first_name = punishment.get('moderator_first_name', '') or ''
+    mod_last_name = punishment.get('moderator_last_name', '') or ''
+    
+    # Убираем "None" из имени
+    if mod_first_name == 'None':
+        mod_first_name = ''
+    if mod_last_name == 'None':
+        mod_last_name = ''
+    
+    if mod_id:
+        if mod_username:
+            mod_display = f"<a href='tg://user?id={mod_id}'>@{mod_username}</a>"
+        elif mod_first_name or mod_last_name:
+            mod_display_name = f"{mod_first_name} {mod_last_name}".strip()
+            mod_display = f"<a href='tg://user?id={mod_id}'>{mod_display_name}</a>"
+        else:
+            mod_display = f"<a href='tg://user?id={mod_id}'>ID{mod_id}</a>"
+    else:
+        mod_display = "Неизвестно"
+    
+    # Форматируем дату
+    try:
+        date_str = punishment['date']
+        if date_str:
+            date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            formatted_date = date_obj.strftime('%d.%m.%Y %H:%M')
+        else:
+            formatted_date = "Неизвестно"
+    except Exception:
+        formatted_date = "Неизвестно"
+    
+    # Формируем статус
+    # Кики всегда завершены - это разовое действие
+    if punishment.get('punishment_type') == 'kick':
+        status = "Завершен"
+    elif verified_status is True:
+        status = "Активен (проверено)"
+    elif verified_status is False:
+        status = "Завершен"
+    elif verified_status is None:
+        if punishment.get('is_active'):
+            status = "Активен (не проверено)"
+        else:
+            status = "Завершен"
+    else:
+        status = "Неизвестно"
+    
+    # Формируем причину (показываем только если указана)
+    reason = punishment.get('reason')
+    if reason and reason.strip():
+        # Обрезаем длинную причину
+        if len(reason) > 30:
+            reason_display = reason[:27] + "..."
+        else:
+            reason_display = reason
+        reason_part = f" | {reason_display}"
+    else:
+        reason_part = ""
+    
+    # Собираем результат в одну строку
+    result = f"{emoji} {type_name} | {user_display}{reason_part} | Модератор: {mod_display} | {formatted_date} | {status}"
+    
+    return result
+
+
+@require_admin_rights
+async def punishhistory_command(message: Message):
+    """Команда просмотра истории наказаний"""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    # Проверяем права на просмотр истории наказаний
+    can_view = await check_permission(chat_id, user_id, 'can_view_punishhistory', lambda r: r <= 3)
+    if not can_view:
+        sent_message = await message.answer("❌ У вас нет прав для просмотра истории наказаний")
+        asyncio.create_task(delete_message_after_delay(sent_message, 5))
+        return
+    
+    # Сразу показываем все наказания
+    await show_punishment_panel(message, page=1)
+
+
+async def show_punishment_type_menu(message_or_callback):
+    """
+    Показывает меню выбора типа наказания
+    
+    Args:
+        message_or_callback: Message или CallbackQuery объект
+    """
+    # Определяем chat_id и способ отправки сообщения
+    if isinstance(message_or_callback, Message):
+        chat_id = message_or_callback.chat.id
+        send_func = message_or_callback.answer
+        edit_func = None
+    else:  # CallbackQuery
+        chat_id = message_or_callback.message.chat.id
+        send_func = None
+        edit_func = message_or_callback.message.edit_text
+    
+    text = "📋 <b>История наказаний</b>\n\n"
+    text += "Выберите тип наказания для просмотра:"
+    
+    # Создаем клавиатуру с выбором типа
+    builder = InlineKeyboardBuilder()
+    
+    type_buttons = [
+        ('🔴 Баны', 'ban'),
+        ('🔇 Муты', 'mute'),
+        ('⚠️ Варны', 'warn'),
+        ('👢 Кики', 'kick'),
+        ('📊 Все', 'all')
+    ]
+    
+    for btn_text, btn_type in type_buttons:
+        builder.button(
+            text=btn_text,
+            callback_data=f"punishhistory_type_{btn_type}"
+        )
+    
+    builder.adjust(2, 2, 1)
+    
+    # Отправляем или редактируем сообщение
+    try:
+        if edit_func:
+            await edit_func(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+            if isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.answer()
+        else:
+            await send_func(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Ошибка при отображении меню выбора типа: {e}")
+
+
+async def show_punishment_panel(message_or_callback, page: int = 1):
+    """
+    Показывает панель истории наказаний
+    
+    Args:
+        message_or_callback: Message или CallbackQuery объект
+        page: Номер страницы
+    """
+    # Определяем chat_id и способ отправки сообщения
+    if isinstance(message_or_callback, Message):
+        chat_id = message_or_callback.chat.id
+        send_func = message_or_callback.answer
+        edit_func = None
+    else:  # CallbackQuery
+        chat_id = message_or_callback.message.chat.id
+        send_func = None
+        edit_func = message_or_callback.message.edit_text
+    
+    # Получаем все наказания (и активные, и завершенные)
+    result = await moderation_db.get_punishments_paginated(
+        chat_id=chat_id,
+        page=page,
+        per_page=10,
+        punishment_type=None,  # Все типы
+        active_only=None  # Все наказания
+    )
+    
+    punishments = result['punishments']
+    total_count = result['total_count']
+    total_pages = result['total_pages']
+    
+    # Формируем текст заголовка
+    header = f"📋 <b>История наказаний</b>\n\n"
+    header += f"Всего записей: {total_count}\n"
+    header += f"Страница {page} из {total_pages}\n\n"
+    
+    if not punishments:
+        text = header + "История наказаний пуста."
+    else:
+        text = header
+        # Проверяем статус в Telegram для активных ban и mute
+        for punishment in punishments:
+            verified_status = None
+            # Проверяем только для активных ban и mute
+            if punishment.get('is_active') and punishment['punishment_type'] in ['ban', 'mute']:
+                verified_status = await verify_punishment_status(
+                    chat_id, punishment['user_id'], punishment['punishment_type']
+                )
+            
+            entry = format_punishment_entry(punishment, verified_status)
+            text += entry + "\n"
+    
+    # Создаем клавиатуру - только пагинация
+    builder = InlineKeyboardBuilder()
+    
+    # Кнопки пагинации
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data=f"punishhistory_page_{page - 1}"
+        ))
+    
+    nav_buttons.append(InlineKeyboardButton(
+        text=f"{page}/{total_pages}",
+        callback_data="punishhistory_noop"
+    ))
+    
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(
+            text="Вперед ▶️",
+            callback_data=f"punishhistory_page_{page + 1}"
+        ))
+    
+    if nav_buttons:
+        builder.row(*nav_buttons)
+    
+    # Кнопка обновления
+    builder.button(
+        text="🔄 Обновить", 
+        callback_data=f"punishhistory_refresh_{page}"
+    )
+    
+    # Отправляем или редактируем сообщение
+    try:
+        if edit_func:
+            await edit_func(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+            if isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.answer()
+        else:
+            await send_func(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Ошибка при отображении панели наказаний: {e}")
+
+
+async def punishhistory_page_callback(callback: CallbackQuery):
+    """Обработчик переключения страницы"""
+    try:
+        chat_id = callback.message.chat.id
+        user_id = callback.from_user.id
+        
+        # Проверяем права
+        can_view = await check_permission(chat_id, user_id, 'can_view_stats', lambda r: r <= 3)
+        if not can_view:
+            await callback.answer("❌ У вас нет прав для просмотра истории наказаний", show_alert=True)
+            return
+        
+        # Формат: punishhistory_page_{page}
+        parts = callback.data.split('_')
+        if len(parts) >= 3:
+            page = int(parts[2])
+            await show_punishment_panel(callback, page=page)
+        else:
+            await callback.answer("❌ Ошибка в данных страницы", show_alert=True)
+    except Exception as e:
+        logger.error(f"Ошибка в punishhistory_page_callback: {e}")
+        await callback.answer("❌ Ошибка при переключении страницы", show_alert=True)
+
+
+async def punishhistory_refresh_callback(callback: CallbackQuery):
+    """Обработчик обновления панели"""
+    try:
+        chat_id = callback.message.chat.id
+        user_id = callback.from_user.id
+        
+        # Проверяем права
+        can_view = await check_permission(chat_id, user_id, 'can_view_stats', lambda r: r <= 3)
+        if not can_view:
+            await callback.answer("❌ У вас нет прав для просмотра истории наказаний", show_alert=True)
+            return
+        
+        # Формат: punishhistory_refresh_{page}
+        parts = callback.data.split('_')
+        if len(parts) >= 3:
+            page = int(parts[2])
+            await show_punishment_panel(callback, page)
+        else:
+            # Fallback на значения по умолчанию
+            await show_punishment_panel(callback, page=1)
+    except Exception as e:
+        logger.error(f"Ошибка в punishhistory_refresh_callback: {e}")
+        await callback.answer("❌ Ошибка при обновлении", show_alert=True)
+
+
+async def punishhistory_noop_callback(callback: CallbackQuery):
+    """Пустой обработчик для кнопки с номером страницы"""
+    await callback.answer()
 
 

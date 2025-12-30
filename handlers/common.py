@@ -484,7 +484,7 @@ async def command_alias_handler(message: Message):
     """Универсальный обработчик алиасов команд"""
     from handlers.profile import myprofile_command
     from handlers.top_chats import top_users_command, top_users_all_chats_command
-    from handlers.moderation import mute_command, unmute_command, kick_command, ban_command, unban_command, warn_command, unwarn_command, ap_command, unap_command, staff_command
+    from handlers.moderation import mute_command, unmute_command, kick_command, ban_command, unban_command, warn_command, unwarn_command, ap_command, unap_command, staff_command, punishhistory_command
     from handlers.settings import settings_command, selfdemote_command, rules_command
     from handlers.raid_protection import raid_protection_command
     
@@ -607,6 +607,7 @@ async def command_alias_handler(message: Message):
         "myprofile_self": myprofile_command,
         "settings": settings_command,
         "ap": ap_command,
+        "punishhistory": punishhistory_command,
         "unap": unap_command,
         "selfdemote": selfdemote_command,
         "staff": staff_command,
@@ -692,6 +693,8 @@ async def help_command(message: Message):
 • <code>/unmute @username</code> - размутить пользователя
 • <code>/kick @username</code> - исключить из чата
 • <code>/kick</code> - исключить (при ответе на сообщение)
+• <code>/punishhistory</code> или <code>/История наказаний</code> - история наказаний (модераторы)
+• <code>/userinfo</code> или <code>/ui</code> - информация о пользователе из Telegram API
 
 <b>Система предупреждений:</b>
 • <code>/warn</code> - выдать предупреждение (при ответе)
