@@ -28,7 +28,8 @@ DEFAULT_RANK_PERMISSIONS = {
         'can_assign_rank_2': True, 'can_remove_rank': True,
         'can_config_warns': True, 'can_config_ranks': True,
         'can_manage_rules': True,
-        'can_view_stats': True
+        'can_view_stats': True,
+        'can_view_punishhistory': True
     },
     2: {  # Администратор - настройки и назначение
         'can_warn': True, 'can_unwarn': True,
@@ -38,7 +39,8 @@ DEFAULT_RANK_PERMISSIONS = {
         'can_assign_rank_2': False, 'can_remove_rank': True,
         'can_config_warns': True, 'can_config_ranks': True,
         'can_manage_rules': True,
-        'can_view_stats': True
+        'can_view_stats': True,
+        'can_view_punishhistory': True
     },
     3: {  # Старший модератор - баны и кики
         'can_warn': True, 'can_unwarn': True,
@@ -48,7 +50,8 @@ DEFAULT_RANK_PERMISSIONS = {
         'can_assign_rank_2': False, 'can_remove_rank': False,
         'can_config_warns': False, 'can_config_ranks': False,
         'can_manage_rules': False,
-        'can_view_stats': True
+        'can_view_stats': True,
+        'can_view_punishhistory': True
     },
     4: {  # Младший модератор - варны и муты
         'can_warn': True, 'can_unwarn': True,
@@ -58,7 +61,8 @@ DEFAULT_RANK_PERMISSIONS = {
         'can_assign_rank_2': False, 'can_remove_rank': False,
         'can_config_warns': False, 'can_config_ranks': False,
         'can_manage_rules': False,
-        'can_view_stats': True
+        'can_view_stats': True,
+        'can_view_punishhistory': False
     },
     5: {  # Пользователь - нет прав
         'can_warn': False, 'can_unwarn': False,
@@ -68,7 +72,8 @@ DEFAULT_RANK_PERMISSIONS = {
         'can_assign_rank_2': False, 'can_remove_rank': False,
         'can_config_warns': False, 'can_config_ranks': False,
         'can_manage_rules': False,
-        'can_view_stats': False
+        'can_view_stats': False,
+        'can_view_punishhistory': False
     }
 }
 

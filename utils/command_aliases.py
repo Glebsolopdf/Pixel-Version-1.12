@@ -37,6 +37,7 @@ COMMAND_ALIASES = {
 
     # Служебное
     "кто админ": "staff",
+    "история наказаний": "punishhistory",
     
     # Защита от рейдов
     "антирейд": "raidprotection",
