@@ -399,10 +399,20 @@ class Database:
                     except sqlite3.OperationalError:
                         pass
                 
+                # Убедимся, что в таблице chat_stat_settings есть колонка userinfo_enabled
+                cursor = db.execute("PRAGMA table_info(chat_stat_settings)")
+                stat_columns = [column[1] for column in cursor.fetchall()]
+                if 'userinfo_enabled' not in stat_columns:
+                    try:
+                        db.execute("ALTER TABLE chat_stat_settings ADD COLUMN userinfo_enabled BOOLEAN DEFAULT 1")
+                        db.commit()
+                    except sqlite3.OperationalError:
+                        pass
+                
                 # Создаем настройки по умолчанию для всех чатов, у которых их еще нет
                 db.execute("""
-                    INSERT OR IGNORE INTO chat_stat_settings (chat_id, stats_enabled, count_media, profile_enabled)
-                    SELECT chat_id, 1, 1, 1 FROM chats
+                    INSERT OR IGNORE INTO chat_stat_settings (chat_id, stats_enabled, count_media, profile_enabled, userinfo_enabled)
+                    SELECT chat_id, 1, 1, 1, 1 FROM chats
                 """)
                 
                 # Проверяем, существует ли таблица user_last_message
@@ -2437,7 +2447,7 @@ class Database:
             try:
                 with sqlite3.connect(self.db_path) as db:
                     cursor = db.execute("""
-                        SELECT stats_enabled, count_media, profile_enabled
+                        SELECT stats_enabled, count_media, profile_enabled, userinfo_enabled
                         FROM chat_stat_settings 
                         WHERE chat_id = ?
                     """, (chat_id,))
@@ -2448,6 +2458,7 @@ class Database:
                             'stats_enabled': bool(row[0]),
                             'count_media': bool(row[1]) if row[1] is not None else True,
                             'profile_enabled': bool(row[2]) if len(row) > 2 and row[2] is not None else True,
+                            'userinfo_enabled': bool(row[3]) if len(row) > 3 and row[3] is not None else True,
                         }
                     else:
                         # Возвращаем настройки по умолчанию
@@ -2455,6 +2466,7 @@ class Database:
                             'stats_enabled': True,
                             'count_media': True,
                             'profile_enabled': True,
+                            'userinfo_enabled': True,
                         }
             except Exception as e:
                 logger.error(f"Ошибка при получении настроек статистики для чата {chat_id}: {e}")
@@ -2462,6 +2474,7 @@ class Database:
                     'stats_enabled': True,
                     'count_media': True,
                     'profile_enabled': True,
+                    'userinfo_enabled': True,
                 }
         
         return await asyncio.get_event_loop().run_in_executor(None, _get_settings_sync)
@@ -2515,14 +2528,15 @@ class Database:
             try:
                 with sqlite3.connect(self.db_path) as db:
                     db.execute("""
-                        INSERT OR REPLACE INTO chat_stat_settings (chat_id, stats_enabled, count_media, profile_enabled)
+                        INSERT OR REPLACE INTO chat_stat_settings (chat_id, stats_enabled, count_media, profile_enabled, userinfo_enabled)
                         VALUES (
                             ?,
                             COALESCE((SELECT stats_enabled FROM chat_stat_settings WHERE chat_id = ?), 1),
                             COALESCE((SELECT count_media FROM chat_stat_settings WHERE chat_id = ?), 1),
-                            ?
+                            ?,
+                            COALESCE((SELECT userinfo_enabled FROM chat_stat_settings WHERE chat_id = ?), 1)
                         )
-                    """, (chat_id, chat_id, chat_id, enabled))
+                    """, (chat_id, chat_id, chat_id, enabled, chat_id))
                     db.commit()
                     return True
             except Exception as e:
@@ -2530,6 +2544,29 @@ class Database:
                 return False
 
         return await asyncio.get_event_loop().run_in_executor(None, _set_profile_sync)
+    
+    async def set_chat_stats_userinfo_enabled(self, chat_id: int, enabled: bool) -> bool:
+        """Включить/выключить команду userinfo в чате"""
+        def _set_userinfo_sync():
+            try:
+                with sqlite3.connect(self.db_path) as db:
+                    db.execute("""
+                        INSERT OR REPLACE INTO chat_stat_settings (chat_id, stats_enabled, count_media, profile_enabled, userinfo_enabled)
+                        VALUES (
+                            ?,
+                            COALESCE((SELECT stats_enabled FROM chat_stat_settings WHERE chat_id = ?), 1),
+                            COALESCE((SELECT count_media FROM chat_stat_settings WHERE chat_id = ?), 1),
+                            COALESCE((SELECT profile_enabled FROM chat_stat_settings WHERE chat_id = ?), 1),
+                            ?
+                        )
+                    """, (chat_id, chat_id, chat_id, chat_id, enabled))
+                    db.commit()
+                    return True
+            except Exception as e:
+                logger.error(f"Ошибка при изменении настройки userinfo_enabled для чата {chat_id}: {e}")
+                return False
+
+        return await asyncio.get_event_loop().run_in_executor(None, _set_userinfo_sync)
     
     async def set_user_mention_ping_enabled(self, user_id: int, enabled: bool) -> bool:
         """Включить/выключить кликабельные упоминания (ping) в статистике для пользователя (глобально)"""

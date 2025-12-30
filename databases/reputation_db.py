@@ -190,8 +190,8 @@ class ReputationDatabase:
         
         return await asyncio.get_event_loop().run_in_executor(None, _get_stats_sync)
     
-    async def cleanup_old_punishments(self, days: int = 3) -> int:
-        """Удалить наказания старше N дней"""
+    async def cleanup_old_punishments(self, days: int = 7) -> int:
+        """Удалить наказания старше N дней (по умолчанию 7 дней)"""
         def _cleanup_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:

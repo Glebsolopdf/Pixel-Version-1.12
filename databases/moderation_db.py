@@ -256,43 +256,46 @@ class ModerationDatabase:
         
         return await asyncio.get_event_loop().run_in_executor(None, _cleanup_expired_sync)
     
-    async def cleanup_old_records(self, days_to_keep: int = 180) -> bool:
-        """Автоматическая очистка старых записей (по умолчанию старше 6 месяцев)"""
+    async def cleanup_old_records(self, days_to_keep: int = 7) -> bool:
+        """Автоматическая очистка старых записей (по умолчанию старше 7 дней)"""
         def _cleanup_old_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:
                     # Вычисляем дату, старше которой удаляем записи
                     cutoff_date = (datetime.now() - timedelta(days=days_to_keep)).isoformat()
+                    logger.info(f"🧹 Начало очистки записей модерации старше {cutoff_date} (сейчас {datetime.now().isoformat()})")
                     
                     # Сначала подсчитываем, сколько записей будет удалено
                     cursor = db.execute("""
                         SELECT COUNT(*) FROM punishments 
-                        WHERE is_active = 0 AND punishment_date < ?
+                        WHERE punishment_date < ?
                     """, (cutoff_date,))
                     old_punishments_count = cursor.fetchone()[0]
                     
                     cursor = db.execute("""
                         SELECT COUNT(*) FROM warns 
-                        WHERE is_active = 0 AND warn_date < ?
+                        WHERE warn_date < ?
                     """, (cutoff_date,))
                     old_warns_count = cursor.fetchone()[0]
                     
+                    logger.info(f"🧹 Найдено {old_punishments_count} старых наказаний и {old_warns_count} старых варнов для удаления")
+                    
                     # Если нет старых записей, не делаем ничего
                     if old_punishments_count == 0 and old_warns_count == 0:
-                        logger.debug("Нет старых записей для очистки")
+                        logger.info("Нет старых записей для очистки")
                         return True
                     
-                    # Удаляем старые неактивные наказания
+                    # Удаляем все старые наказания (и активные, и завершенные)
                     cursor = db.execute("""
                         DELETE FROM punishments 
-                        WHERE is_active = 0 AND punishment_date < ?
+                        WHERE punishment_date < ?
                     """, (cutoff_date,))
                     deleted_punishments = cursor.rowcount
                     
-                    # Удаляем старые неактивные варны
+                    # Удаляем все старые варны (и активные, и завершенные)
                     cursor = db.execute("""
                         DELETE FROM warns 
-                        WHERE is_active = 0 AND warn_date < ?
+                        WHERE warn_date < ?
                     """, (cutoff_date,))
                     deleted_warns = cursor.rowcount
                     
@@ -303,11 +306,11 @@ class ModerationDatabase:
                     if total_deleted > 0:
                         logger.info(f"🧹 Автоматическая очистка: удалено {deleted_punishments} наказаний и {deleted_warns} варнов (старше {days_to_keep} дней)")
                     else:
-                        logger.debug("Автоматическая очистка: нет записей для удаления")
+                        logger.warning(f"Автоматическая очистка: ожидалось удаление {old_punishments_count + old_warns_count} записей, но удалено {total_deleted}")
                     
                     return True
             except Exception as e:
-                logger.error(f"Ошибка при автоматической очистке старых записей: {e}")
+                logger.error(f"Ошибка при автоматической очистке старых записей: {e}", exc_info=True)
                 return False
         
         return await asyncio.get_event_loop().run_in_executor(None, _cleanup_old_sync)
@@ -564,6 +567,153 @@ class ModerationDatabase:
                 return False
         
         return await asyncio.get_event_loop().run_in_executor(None, _delete_sync)
+    
+    async def get_punishments_paginated(self, chat_id: int, page: int = 1, per_page: int = 10, 
+                                       punishment_type: str = None, active_only: Optional[bool] = None) -> Dict[str, Any]:
+        """
+        Получение наказаний с пагинацией (объединяет punishments и warns)
+        
+        Args:
+            chat_id: ID чата
+            page: Номер страницы (начинается с 1)
+            per_page: Количество записей на странице
+            punishment_type: Тип наказания ('ban', 'mute', 'kick', 'warn') или None для всех
+            active_only: True - только активные, False - только завершенные, None - все
+        
+        Returns:
+            dict с ключами: 'punishments' (список), 'total_count' (int), 'total_pages' (int), 'page' (int)
+        """
+        def _get_paginated_sync():
+            try:
+                with sqlite3.connect(self.db_path) as db:
+                    # Выполняем запросы отдельно и объединяем результаты в Python
+                    all_punishments = []
+                    
+                    # Определяем, какие таблицы использовать
+                    use_punishments = True
+                    use_warns = True
+                    
+                    if punishment_type:
+                        if punishment_type == 'warn':
+                            use_punishments = False
+                        else:
+                            use_warns = False
+                    
+                    # Запрос для punishments
+                    if use_punishments:
+                        punishments_where = ["chat_id = ?"]
+                        params = [chat_id]
+                        
+                        if punishment_type:
+                            punishments_where.append("punishment_type = ?")
+                            params.append(punishment_type)
+                        
+                        if active_only is not None:
+                            punishments_where.append("is_active = ?")
+                            params.append(1 if active_only else 0)
+                        
+                        where_clause = " AND ".join(punishments_where)
+                        punishments_query = (
+                            "SELECT id, user_id, punishment_type, reason, duration_seconds, "
+                            "punishment_date as date, expiry_date, is_active, "
+                            "user_username, user_first_name, user_last_name, "
+                            "moderator_id, moderator_username, moderator_first_name, moderator_last_name, "
+                            "'punishment' as source_table "
+                            "FROM punishments WHERE " + where_clause
+                        )
+                        
+                        cursor = db.execute(punishments_query, params)
+                        rows = cursor.fetchall()
+                        for row in rows:
+                            all_punishments.append({
+                                'id': row[0],
+                                'user_id': row[1],
+                                'punishment_type': row[2],
+                                'reason': row[3],
+                                'duration_seconds': row[4],
+                                'date': row[5],
+                                'expiry_date': row[6],
+                                'is_active': bool(row[7]),
+                                'user_username': row[8],
+                                'user_first_name': row[9],
+                                'user_last_name': row[10],
+                                'moderator_id': row[11],
+                                'moderator_username': row[12],
+                                'moderator_first_name': row[13],
+                                'moderator_last_name': row[14],
+                                'source_table': row[15]
+                            })
+                    
+                    # Запрос для warns
+                    if use_warns:
+                        warns_where = ["chat_id = ?"]
+                        warn_params = [chat_id]
+                        
+                        if active_only is not None:
+                            warns_where.append("is_active = ?")
+                            warn_params.append(1 if active_only else 0)
+                        
+                        where_clause = " AND ".join(warns_where)
+                        warns_query = (
+                            "SELECT id, user_id, 'warn' as punishment_type, reason, NULL as duration_seconds, "
+                            "warn_date as date, NULL as expiry_date, is_active, "
+                            "user_username, user_first_name, user_last_name, "
+                            "moderator_id, moderator_username, moderator_first_name, moderator_last_name, "
+                            "'warn' as source_table "
+                            "FROM warns WHERE " + where_clause
+                        )
+                        
+                        cursor = db.execute(warns_query, warn_params)
+                        rows = cursor.fetchall()
+                        for row in rows:
+                            all_punishments.append({
+                                'id': row[0],
+                                'user_id': row[1],
+                                'punishment_type': row[2],
+                                'reason': row[3],
+                                'duration_seconds': row[4],
+                                'date': row[5],
+                                'expiry_date': row[6],
+                                'is_active': bool(row[7]),
+                                'user_username': row[8],
+                                'user_first_name': row[9],
+                                'user_last_name': row[10],
+                                'moderator_id': row[11],
+                                'moderator_username': row[12],
+                                'moderator_first_name': row[13],
+                                'moderator_last_name': row[14],
+                                'source_table': row[15]
+                            })
+                    
+                    # Сортируем по дате (новые сначала)
+                    all_punishments.sort(key=lambda x: x.get('date', '') or '', reverse=True)
+                    
+                    # Подсчитываем общее количество
+                    total_count = len(all_punishments)
+                    
+                    # Вычисляем пагинацию
+                    total_pages = (total_count + per_page - 1) // per_page if total_count > 0 else 1
+                    offset = (page - 1) * per_page
+                    
+                    # Применяем пагинацию
+                    punishments = all_punishments[offset:offset + per_page]
+                    
+                    return {
+                        'punishments': punishments,
+                        'total_count': total_count,
+                        'total_pages': total_pages,
+                        'page': page
+                    }
+            except Exception as e:
+                logger.error(f"Ошибка при получении наказаний с пагинацией для чата {chat_id}: {e}")
+                return {
+                    'punishments': [],
+                    'total_count': 0,
+                    'total_pages': 1,
+                    'page': 1
+                }
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _get_paginated_sync)
 
 
 # Глобальный экземпляр базы данных модерации
