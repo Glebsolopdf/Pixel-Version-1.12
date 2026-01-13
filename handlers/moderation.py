@@ -539,13 +539,8 @@ async def unmute_command(message: Message):
             f"<blockquote>{quote}</blockquote>"
         )
         
-        # Проверяем настройку silent mute
-        settings = await raid_protection_db.get_settings(chat_id)
-        mute_silent = settings.get('mute_silent', False)
-        
-        # Отправляем сообщение в чат только если silent mode выключен
-        if not mute_silent:
-            await send_message_with_gif(message, message_text, "unmute", parse_mode=ParseMode.HTML)
+        # Отправляем сообщение в чат
+        await send_message_with_gif(message, message_text, "unmute", parse_mode=ParseMode.HTML)
         
         # Отправляем уведомление пользователю
         try:

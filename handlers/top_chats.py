@@ -365,6 +365,9 @@ async def top_chats_callback(callback: CallbackQuery):
                 callback_data=f"join_chat_{chat['chat_id']}"
             ))
         
+        # Размещаем кнопки чатов по 2 в ряд
+        builder.adjust(2)
+        
         builder.row(
             InlineKeyboardButton(text="🔄 Обновить", callback_data="top_chats"),
             InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")
