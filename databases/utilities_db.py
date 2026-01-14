@@ -65,6 +65,22 @@ class UtilitiesDatabase:
                     # Колонка уже существует
                     pass
                 
+                # Добавляем колонку auto_ban_channels_enabled если её нет
+                try:
+                    db.execute("ALTER TABLE utilities_settings ADD COLUMN auto_ban_channels_enabled BOOLEAN DEFAULT 0")
+                    db.commit()
+                except sqlite3.OperationalError:
+                    # Колонка уже существует
+                    pass
+                
+                # Добавляем колонку auto_ban_channels_duration если её нет
+                try:
+                    db.execute("ALTER TABLE utilities_settings ADD COLUMN auto_ban_channels_duration INTEGER DEFAULT NULL")
+                    db.commit()
+                except sqlite3.OperationalError:
+                    # Колонка уже существует
+                    pass
+                
                 # Таблица для отслеживания реакций пользователей
                 db.execute("""
                     CREATE TABLE IF NOT EXISTS reaction_activity (
@@ -130,33 +146,34 @@ class UtilitiesDatabase:
         def _get_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:
-                    # Проверяем наличие reaction_spam_silent в схеме
+                    # Проверяем наличие колонок в схеме
                     cursor_columns = db.execute("PRAGMA table_info(utilities_settings)")
                     columns = [col[1] for col in cursor_columns.fetchall()]
                     has_silent = 'reaction_spam_silent' in columns
+                    has_auto_ban = 'auto_ban_channels_enabled' in columns
+                    has_auto_ban_duration = 'auto_ban_channels_duration' in columns
                     
+                    # Формируем запрос в зависимости от наличия колонок
+                    select_fields = [
+                        'emoji_spam_enabled', 'emoji_spam_limit',
+                        'reaction_spam_enabled', 'reaction_spam_limit',
+                        'reaction_spam_window', 'reaction_spam_warning_enabled',
+                        'reaction_spam_punishment', 'reaction_spam_ban_duration',
+                        'fake_commands_enabled'
+                    ]
                     if has_silent:
-                        cursor = db.execute("""
-                            SELECT emoji_spam_enabled, emoji_spam_limit,
-                                   reaction_spam_enabled, reaction_spam_limit,
-                                   reaction_spam_window, reaction_spam_warning_enabled,
-                                   reaction_spam_punishment, reaction_spam_ban_duration,
-                                   fake_commands_enabled, reaction_spam_silent
-                            FROM utilities_settings WHERE chat_id = ?
-                        """, (chat_id,))
-                    else:
-                        cursor = db.execute("""
-                            SELECT emoji_spam_enabled, emoji_spam_limit,
-                                   reaction_spam_enabled, reaction_spam_limit,
-                                   reaction_spam_window, reaction_spam_warning_enabled,
-                                   reaction_spam_punishment, reaction_spam_ban_duration,
-                                   fake_commands_enabled
-                            FROM utilities_settings WHERE chat_id = ?
-                        """, (chat_id,))
+                        select_fields.append('reaction_spam_silent')
+                    if has_auto_ban:
+                        select_fields.append('auto_ban_channels_enabled')
+                    if has_auto_ban_duration:
+                        select_fields.append('auto_ban_channels_duration')
+                    
+                    query = f"SELECT {', '.join(select_fields)} FROM utilities_settings WHERE chat_id = ?"
+                    cursor = db.execute(query, (chat_id,))
                     row = cursor.fetchone()
                     
                     if row:
-                        return {
+                        result = {
                             'emoji_spam_enabled': bool(row[0]),
                             'emoji_spam_limit': row[1],
                             'reaction_spam_enabled': bool(row[2]),
@@ -166,8 +183,17 @@ class UtilitiesDatabase:
                             'reaction_spam_punishment': row[6],
                             'reaction_spam_ban_duration': row[7],
                             'fake_commands_enabled': bool(row[8]) if len(row) > 8 else False,
-                            'reaction_spam_silent': bool(row[9]) if has_silent and len(row) > 9 else False
                         }
+                        idx = 9
+                        if has_silent:
+                            result['reaction_spam_silent'] = bool(row[idx]) if len(row) > idx else False
+                            idx += 1
+                        if has_auto_ban:
+                            result['auto_ban_channels_enabled'] = bool(row[idx]) if len(row) > idx else False
+                            idx += 1
+                        if has_auto_ban_duration:
+                            result['auto_ban_channels_duration'] = row[idx] if len(row) > idx else None
+                        return result
                     else:
                         # Возвращаем настройки по умолчанию
                         return {
@@ -180,7 +206,9 @@ class UtilitiesDatabase:
                             'reaction_spam_punishment': 'kick',
                             'reaction_spam_ban_duration': 300,
                             'fake_commands_enabled': False,
-                            'reaction_spam_silent': False
+                            'reaction_spam_silent': False,
+                            'auto_ban_channels_enabled': False,
+                            'auto_ban_channels_duration': None
                         }
             except Exception as e:
                 logger.error(f"Ошибка при получении настроек утилит для чата {chat_id}: {e}")
@@ -194,7 +222,9 @@ class UtilitiesDatabase:
                     'reaction_spam_punishment': 'kick',
                     'reaction_spam_ban_duration': 3600,
                     'fake_commands_enabled': False,
-                    'reaction_spam_silent': False
+                    'reaction_spam_silent': False,
+                    'auto_ban_channels_enabled': False,
+                    'auto_ban_channels_duration': None
                 }
         
         return await asyncio.get_event_loop().run_in_executor(None, _get_sync)
@@ -229,7 +259,9 @@ class UtilitiesDatabase:
                             'reaction_spam_punishment': 'kick',
                             'reaction_spam_ban_duration': 300,
                             'fake_commands_enabled': 0,
-                            'reaction_spam_silent': 0
+                            'reaction_spam_silent': 0,
+                            'auto_ban_channels_enabled': 0,
+                            'auto_ban_channels_duration': None
                         }
                         defaults[setting_name] = db_value
                         
@@ -282,7 +314,9 @@ class UtilitiesDatabase:
                             'reaction_spam_punishment': 'kick',
                             'reaction_spam_ban_duration': 300,
                             'fake_commands_enabled': 0,
-                            'reaction_spam_silent': 0
+                            'reaction_spam_silent': 0,
+                            'auto_ban_channels_enabled': 0,
+                            'auto_ban_channels_duration': None
                         }
                         
                         # Применяем переданные kwargs к дефолтным значениям

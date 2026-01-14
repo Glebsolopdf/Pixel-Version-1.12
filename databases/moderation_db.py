@@ -92,8 +92,35 @@ class ModerationDatabase:
                     # Поле уже существует
                     pass
                 
+                # Миграция: добавляем поле channel_id в таблицу punishments, если его нет
+                try:
+                    db.execute("ALTER TABLE punishments ADD COLUMN channel_id INTEGER")
+                    logger.info("Добавлено поле channel_id в таблицу punishments")
+                except sqlite3.OperationalError:
+                    # Поле уже существует
+                    pass
+                
+                # Таблица для хранения ручных банов каналов модераторами
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS banned_channels (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id INTEGER,
+                        channel_id INTEGER,
+                        channel_username TEXT,
+                        channel_title TEXT,
+                        moderator_id INTEGER,
+                        moderator_username TEXT,
+                        moderator_first_name TEXT,
+                        moderator_last_name TEXT,
+                        reason TEXT,
+                        ban_date TEXT,
+                        is_active BOOLEAN DEFAULT 1
+                    )
+                """)
+                
                 # Создаем индексы для оптимизации
                 db.execute("CREATE INDEX IF NOT EXISTS idx_punishments_chat_user ON punishments (chat_id, user_id)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_punishments_chat_channel ON punishments (chat_id, channel_id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_punishments_chat_type ON punishments (chat_id, punishment_type)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_punishments_active ON punishments (is_active)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_punishments_expiry ON punishments (expiry_date)")
@@ -102,35 +129,60 @@ class ModerationDatabase:
                 db.execute("CREATE INDEX IF NOT EXISTS idx_warns_chat_user ON warns (chat_id, user_id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_warns_active ON warns (is_active)")
                 
+                # Индексы для banned_channels
+                db.execute("CREATE INDEX IF NOT EXISTS idx_banned_channels_chat_channel ON banned_channels (chat_id, channel_id)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_banned_channels_active ON banned_channels (is_active)")
+                
                 db.commit()
                 logger.info("База данных модерации инициализирована")
         
         await asyncio.get_event_loop().run_in_executor(None, _init_sync)
     
-    async def add_punishment(self, chat_id: int, user_id: int, moderator_id: int, 
-                           punishment_type: str, reason: str = None, 
+    async def add_punishment(self, chat_id: int, user_id: int = None, moderator_id: int = None, 
+                           punishment_type: str = None, reason: str = None, 
                            duration_seconds: int = None, expiry_date: str = None,
                            user_username: str = None, user_first_name: str = None, user_last_name: str = None,
-                           moderator_username: str = None, moderator_first_name: str = None, moderator_last_name: str = None) -> bool:
-        """Добавление записи о наказании"""
+                           moderator_username: str = None, moderator_first_name: str = None, moderator_last_name: str = None,
+                           channel_id: int = None) -> bool:
+        """Добавление записи о наказании (для пользователей или каналов)"""
         def _add_punishment_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:
-                    db.execute("""
-                        INSERT INTO punishments 
-                        (chat_id, user_id, moderator_id, punishment_type, reason, 
-                         duration_seconds, punishment_date, expiry_date,
-                         user_username, user_first_name, user_last_name,
-                         moderator_username, moderator_first_name, moderator_last_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (chat_id, user_id, moderator_id, punishment_type, reason,
-                          duration_seconds, datetime.now().isoformat(), expiry_date,
-                          user_username, user_first_name, user_last_name,
-                          moderator_username, moderator_first_name, moderator_last_name))
+                    # Проверяем наличие channel_id в схеме
+                    cursor_columns = db.execute("PRAGMA table_info(punishments)")
+                    columns = [col[1] for col in cursor_columns.fetchall()]
+                    has_channel_id = 'channel_id' in columns
+                    
+                    if has_channel_id:
+                        db.execute("""
+                            INSERT INTO punishments 
+                            (chat_id, user_id, channel_id, moderator_id, punishment_type, reason, 
+                             duration_seconds, punishment_date, expiry_date,
+                             user_username, user_first_name, user_last_name,
+                             moderator_username, moderator_first_name, moderator_last_name)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (chat_id, user_id, channel_id, moderator_id, punishment_type, reason,
+                              duration_seconds, datetime.now().isoformat(), expiry_date,
+                              user_username, user_first_name, user_last_name,
+                              moderator_username, moderator_first_name, moderator_last_name))
+                    else:
+                        # Fallback для старых схем без channel_id
+                        db.execute("""
+                            INSERT INTO punishments 
+                            (chat_id, user_id, moderator_id, punishment_type, reason, 
+                             duration_seconds, punishment_date, expiry_date,
+                             user_username, user_first_name, user_last_name,
+                             moderator_username, moderator_first_name, moderator_last_name)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (chat_id, user_id if user_id else channel_id, moderator_id, punishment_type, reason,
+                              duration_seconds, datetime.now().isoformat(), expiry_date,
+                              user_username, user_first_name, user_last_name,
+                              moderator_username, moderator_first_name, moderator_last_name))
                     db.commit()
                     return True
             except Exception as e:
-                logger.error(f"Ошибка при добавлении наказания для пользователя {user_id} в чате {chat_id}: {e}")
+                target = f"канала {channel_id}" if channel_id else f"пользователя {user_id}"
+                logger.error(f"Ошибка при добавлении наказания для {target} в чате {chat_id}: {e}")
                 return False
         
         return await asyncio.get_event_loop().run_in_executor(None, _add_punishment_sync)
@@ -198,13 +250,28 @@ class ModerationDatabase:
         def _get_active_punishments_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:
-                    query = """
-                        SELECT id, user_id, punishment_type, reason, 
-                               duration_seconds, punishment_date, expiry_date,
-                               user_username, user_first_name, user_last_name
-                        FROM punishments
-                        WHERE chat_id = ? AND is_active = 1
-                    """
+                    # Проверяем наличие channel_id в схеме
+                    cursor_columns = db.execute("PRAGMA table_info(punishments)")
+                    columns = [col[1] for col in cursor_columns.fetchall()]
+                    has_channel_id = 'channel_id' in columns
+                    
+                    if has_channel_id:
+                        query = """
+                            SELECT id, user_id, channel_id, punishment_type, reason, 
+                                   duration_seconds, punishment_date, expiry_date,
+                                   user_username, user_first_name, user_last_name
+                            FROM punishments
+                            WHERE chat_id = ? AND is_active = 1
+                        """
+                    else:
+                        query = """
+                            SELECT id, user_id, NULL as channel_id, punishment_type, reason, 
+                                   duration_seconds, punishment_date, expiry_date,
+                                   user_username, user_first_name, user_last_name
+                            FROM punishments
+                            WHERE chat_id = ? AND is_active = 1
+                        """
+                    
                     params = [chat_id]
                     
                     if punishment_type:
@@ -219,14 +286,15 @@ class ModerationDatabase:
                         {
                             'id': row[0],
                             'user_id': row[1],
-                            'punishment_type': row[2],
-                            'reason': row[3],
-                            'duration_seconds': row[4],
-                            'punishment_date': row[5],
-                            'expiry_date': row[6],
-                            'user_username': row[7],
-                            'user_first_name': row[8],
-                            'user_last_name': row[9]
+                            'channel_id': row[2] if has_channel_id else None,
+                            'punishment_type': row[3],
+                            'reason': row[4],
+                            'duration_seconds': row[5],
+                            'punishment_date': row[6],
+                            'expiry_date': row[7],
+                            'user_username': row[8],
+                            'user_first_name': row[9],
+                            'user_last_name': row[10]
                         }
                         for row in rows
                     ]
@@ -559,6 +627,7 @@ class ModerationDatabase:
                     db.execute("DELETE FROM punishments WHERE chat_id = ?", (chat_id,))
                     db.execute("DELETE FROM warns WHERE chat_id = ?", (chat_id,))
                     db.execute("DELETE FROM warn_settings WHERE chat_id = ?", (chat_id,))
+                    db.execute("DELETE FROM banned_channels WHERE chat_id = ?", (chat_id,))
                     db.commit()
                     logger.info(f"Данные чата {chat_id} удалены из moderation_db")
                     return True
@@ -567,6 +636,137 @@ class ModerationDatabase:
                 return False
         
         return await asyncio.get_event_loop().run_in_executor(None, _delete_sync)
+    
+    # ========== МЕТОДЫ ДЛЯ РАБОТЫ С БАНАМИ КАНАЛОВ ==========
+    
+    async def add_channel_ban(self, chat_id: int, channel_id: int, moderator_id: int,
+                             channel_username: str = None, channel_title: str = None,
+                             reason: str = None,
+                             moderator_username: str = None, moderator_first_name: str = None, moderator_last_name: str = None) -> bool:
+        """Добавление ручного бана канала модератором (сохраняется в banned_channels и punishments)"""
+        def _add_channel_ban_sync():
+            try:
+                with sqlite3.connect(self.db_path) as db:
+                    # Добавляем в таблицу banned_channels
+                    db.execute("""
+                        INSERT INTO banned_channels 
+                        (chat_id, channel_id, channel_username, channel_title, moderator_id,
+                         moderator_username, moderator_first_name, moderator_last_name,
+                         reason, ban_date, is_active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    """, (chat_id, channel_id, channel_username, channel_title, moderator_id,
+                          moderator_username, moderator_first_name, moderator_last_name,
+                          reason, datetime.now().isoformat()))
+                    
+                    # Также добавляем в punishments для истории
+                    cursor_columns = db.execute("PRAGMA table_info(punishments)")
+                    columns = [col[1] for col in cursor_columns.fetchall()]
+                    has_channel_id = 'channel_id' in columns
+                    
+                    if has_channel_id:
+                        db.execute("""
+                            INSERT INTO punishments 
+                            (chat_id, user_id, channel_id, moderator_id, punishment_type, reason,
+                             duration_seconds, punishment_date, expiry_date,
+                             user_username, user_first_name, user_last_name,
+                             moderator_username, moderator_first_name, moderator_last_name)
+                            VALUES (?, NULL, ?, ?, 'ban', ?, NULL, ?, NULL,
+                                    ?, ?, ?,
+                                    ?, ?, ?)
+                        """, (chat_id, channel_id, moderator_id, reason,
+                              datetime.now().isoformat(),
+                              channel_username, channel_title, None,
+                              moderator_username, moderator_first_name, moderator_last_name))
+                    else:
+                        # Fallback для старых схем
+                        db.execute("""
+                            INSERT INTO punishments 
+                            (chat_id, user_id, moderator_id, punishment_type, reason,
+                             duration_seconds, punishment_date, expiry_date,
+                             user_username, user_first_name, user_last_name,
+                             moderator_username, moderator_first_name, moderator_last_name)
+                            VALUES (?, ?, ?, 'ban', ?, NULL, ?, NULL,
+                                    ?, ?, ?,
+                                    ?, ?, ?)
+                        """, (chat_id, channel_id, moderator_id, reason,
+                              datetime.now().isoformat(),
+                              channel_username, channel_title, None,
+                              moderator_username, moderator_first_name, moderator_last_name))
+                    
+                    db.commit()
+                    return True
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении бана канала {channel_id} в чате {chat_id}: {e}")
+                return False
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _add_channel_ban_sync)
+    
+    async def is_channel_banned(self, chat_id: int, channel_id: int) -> bool:
+        """Проверить, забанен ли канал вручную модератором (проверяет только banned_channels)"""
+        def _is_channel_banned_sync():
+            try:
+                with sqlite3.connect(self.db_path) as db:
+                    cursor = db.execute("""
+                        SELECT COUNT(*) FROM banned_channels
+                        WHERE chat_id = ? AND channel_id = ? AND is_active = 1
+                    """, (chat_id, channel_id))
+                    return cursor.fetchone()[0] > 0
+            except Exception as e:
+                logger.error(f"Ошибка при проверке бана канала {channel_id} в чате {chat_id}: {e}")
+                return False
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _is_channel_banned_sync)
+    
+    async def get_banned_channels(self, chat_id: int) -> List[Dict[str, Any]]:
+        """Получить список забаненных каналов в чате"""
+        def _get_banned_channels_sync():
+            try:
+                with sqlite3.connect(self.db_path) as db:
+                    cursor = db.execute("""
+                        SELECT id, channel_id, channel_username, channel_title,
+                               moderator_username, moderator_first_name, moderator_last_name,
+                               reason, ban_date
+                        FROM banned_channels
+                        WHERE chat_id = ? AND is_active = 1
+                        ORDER BY ban_date DESC
+                    """, (chat_id,))
+                    rows = cursor.fetchall()
+                    return [
+                        {
+                            'id': row[0],
+                            'channel_id': row[1],
+                            'channel_username': row[2],
+                            'channel_title': row[3],
+                            'moderator_username': row[4],
+                            'moderator_first_name': row[5],
+                            'moderator_last_name': row[6],
+                            'reason': row[7],
+                            'ban_date': row[8]
+                        }
+                        for row in rows
+                    ]
+            except Exception as e:
+                logger.error(f"Ошибка при получении списка забаненных каналов в чате {chat_id}: {e}")
+                return []
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _get_banned_channels_sync)
+    
+    async def remove_channel_ban(self, chat_id: int, channel_id: int) -> bool:
+        """Удалить ручной бан канала (деактивировать в banned_channels)"""
+        def _remove_channel_ban_sync():
+            try:
+                with sqlite3.connect(self.db_path) as db:
+                    cursor = db.execute("""
+                        UPDATE banned_channels SET is_active = 0
+                        WHERE chat_id = ? AND channel_id = ? AND is_active = 1
+                    """, (chat_id, channel_id))
+                    db.commit()
+                    return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"Ошибка при удалении бана канала {channel_id} в чате {chat_id}: {e}")
+                return False
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _remove_channel_ban_sync)
     
     async def get_punishments_paginated(self, chat_id: int, page: int = 1, per_page: int = 10, 
                                        punishment_type: str = None, active_only: Optional[bool] = None) -> Dict[str, Any]:
@@ -586,7 +786,7 @@ class ModerationDatabase:
         def _get_paginated_sync():
             try:
                 with sqlite3.connect(self.db_path) as db:
-                    # Выполняем запросы отдельно и объединяем результаты в Python
+                    # Выполняем запросы отдельно и объединяем результаты
                     all_punishments = []
                     
                     # Определяем, какие таблицы использовать
