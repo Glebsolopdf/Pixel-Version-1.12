@@ -1092,6 +1092,45 @@ async def message_handler(message: Message):
                     await utilities_db.add_command_detection(chat_id, command_text)
                     logger.debug(f"Обнаружена команда {command_text} в сообщении от пользователя {message.from_user.id} в чате {chat_id}")
         
+        # Проверка на автоматический бан каналов (сообщения, отправленные от имени канала)
+        if utilities_settings.get('auto_ban_channels_enabled', False):
+            # Проверяем sender_chat - это означает, что сообщение отправлено от имени канала (не переслано)
+            if message.sender_chat and message.sender_chat.type == 'channel':
+                channel = message.sender_chat
+                channel_id = channel.id
+                channel_username = getattr(channel, 'username', None)
+                channel_title = getattr(channel, 'title', None) or (f"@{channel.username}" if channel.username else f"ID{channel.id}")
+                
+                # Всегда пытаемся забанить канал через API
+                # Если канал уже забанен, API вернет ошибку, которую мы игнорируем
+                # Если канал не забанен - баним заново
+                try:
+                    # Для каналов используем ban_chat_sender_chat вместо ban_chat_member
+                    # Примечание: ban_chat_sender_chat не поддерживает временные баны (until_date)
+                    await bot.ban_chat_sender_chat(
+                        chat_id=chat_id,
+                        sender_chat_id=channel_id
+                    )
+                    
+                    logger.info(f"Автоматически забанен канал {channel_id} ({channel_title}) в чате {chat_id}")
+                except Exception as e:
+                    error_str = str(e).lower()
+                    # Если канал уже забанен - это нормально, просто удаляем сообщение
+                    if "already banned" in error_str or "chat is banned" in error_str or "already restricted" in error_str:
+                        logger.debug(f"Канал {channel_id} уже забанен в чате {chat_id}, просто удаляем сообщение")
+                    else:
+                        logger.error(f"Ошибка при автоматическом бане канала {channel_id} в чате {chat_id}: {e}")
+                
+                # Удаляем сообщение в любом случае
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+                    logger.info(f"Удалено сообщение от забаненного канала {channel_id} в чате {chat_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении сообщения от канала {channel_id}: {e}")
+                
+                # Не засчитываем статистику для сообщений от забаненных каналов
+                return
+        
         stat_settings = await db.get_chat_stat_settings(chat_id)
         
         # Проверяем, включена ли статистика для чата

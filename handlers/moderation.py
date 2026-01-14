@@ -5,7 +5,7 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -41,6 +41,30 @@ dp: Optional[Dispatcher] = None
 def get_rank_name(rank: int, count: int = 1) -> str:
     """Получить название ранга с учетом множественного числа"""
     return RANK_NAMES[rank][0] if count == 1 else RANK_NAMES[rank][1]
+
+
+def extract_channel_from_message(message: Message) -> Optional[Dict[str, Any]]:
+    """Извлечь информацию о канале из сообщения, отправленного от имени канала"""
+    # Проверяем sender_chat - это означает, что сообщение отправлено от имени канала
+    if message.sender_chat and message.sender_chat.type == 'channel':
+        channel = message.sender_chat
+        return {
+            'channel_id': channel.id,
+            'channel_username': getattr(channel, 'username', None),
+            'channel_title': getattr(channel, 'title', None) or (f"@{channel.username}" if channel.username else f"ID{channel.id}")
+        }
+    
+    return None
+
+
+def format_channel_mention(channel_id: int, username: str = None, title: str = None) -> str:
+    """Форматировать упоминание канала для сообщений"""
+    if username:
+        return f"@{username}"
+    elif title:
+        return f"<b>{title}</b>"
+    else:
+        return f"<b>Канал ID{channel_id}</b>"
 
 
 def register_moderation_handlers(dispatcher: Dispatcher, bot_instance: Bot):
@@ -94,6 +118,12 @@ async def mute_command(message: Message):
     time_str = None
     
     if message.reply_to_message:
+        # Проверяем, является ли это сообщением от канала
+        channel_info = extract_channel_from_message(message.reply_to_message)
+        if channel_info:
+            await message.answer("❌ Каналы можно только забанить или разбанить. Использование мута для каналов невозможно.")
+            return
+        
         # Проверяем, является ли это системным сообщением
         system_user = await extract_user_from_system_message(message.reply_to_message)
         if system_user:
@@ -587,6 +617,13 @@ async def kick_command(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     
+    # Проверяем, не пытаются ли кикнуть канал
+    if message.reply_to_message:
+        channel_info = extract_channel_from_message(message.reply_to_message)
+        if channel_info:
+            await message.answer("❌ Каналы можно только забанить или разбанить. Использование кика для каналов невозможно.")
+            return
+    
     # Проверяем права - только старшие модераторы и выше могут кикать
     can_kick = await check_permission(chat_id, user_id, 'can_kick', lambda r: r <= 3)
     if not can_kick:
@@ -601,6 +638,12 @@ async def kick_command(message: Message):
     target_user = None
     
     if message.reply_to_message:
+        # Проверяем, не пытаются ли кикнуть канал
+        channel_info = extract_channel_from_message(message.reply_to_message)
+        if channel_info:
+            await message.answer("❌ Каналы можно только забанить или разбанить. Использование кика для каналов невозможно.")
+            return
+        
         if len(args) != 1:
             if await should_show_hint(chat_id, user_id):
                 await message.answer(
@@ -746,6 +789,79 @@ async def ban_command(message: Message):
     duration_seconds = None
     
     if message.reply_to_message:
+        # Проверяем, является ли это сообщением от канала
+        channel_info = extract_channel_from_message(message.reply_to_message)
+        if channel_info:
+            # Это канал - обрабатываем отдельно
+            if len(args) == 1:
+                time_str = "навсегда"
+                duration_seconds = None
+            else:
+                time_str = " ".join(args[1:])
+                duration_seconds = parse_mute_duration(time_str)
+                if duration_seconds is None:
+                    await message.answer(
+                        "❌ <b>Некорректный формат времени</b>\n\n"
+                        "Примеры правильного формата:\n"
+                        "• 30 минут\n"
+                        "• 2 часа\n"
+                        "• 5 дней\n"
+                        "• 60 секунд",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+            
+            # Для каналов временный бан не поддерживается - баним навсегда
+            time_warning = ""
+            if duration_seconds:
+                time_warning = "\n\n⚠️ <i>Примечание: Временный бан для каналов не поддерживается. Канал забанен навсегда.</i>"
+            
+            try:
+                # Для каналов используем ban_chat_sender_chat
+                await bot.ban_chat_sender_chat(
+                    chat_id=chat_id,
+                    sender_chat_id=channel_info['channel_id']
+                )
+                
+                # Сохраняем только в punishments для истории (чтобы знать кто и когда забанил)
+                await moderation_db.add_punishment(
+                    chat_id=chat_id,
+                    user_id=None,
+                    moderator_id=user_id,
+                    punishment_type="ban",
+                    reason=reason,
+                    duration_seconds=None,  # Каналы всегда баним навсегда
+                    expiry_date=None,
+                    user_username=channel_info['channel_username'],
+                    user_first_name=channel_info['channel_title'],
+                    user_last_name=None,
+                    moderator_username=message.from_user.username,
+                    moderator_first_name=message.from_user.first_name,
+                    moderator_last_name=message.from_user.last_name,
+                    channel_id=channel_info['channel_id']
+                )
+                
+                channel_display = format_channel_mention(
+                    channel_info['channel_id'],
+                    channel_info['channel_username'],
+                    channel_info['channel_title']
+                )
+                
+                message_text = f"🚫 Канал {channel_display} был забанен навсегда{time_warning}\n"
+                
+                if reason:
+                    message_text += f"<b>Причина:</b> <i>{reason}</i>\n"
+                message_text += f"<b>Модератор:</b> <i>{message.from_user.first_name or message.from_user.username or 'Неизвестно'}</i>"
+                
+                await send_message_with_gif(message, message_text, "ban", parse_mode=ParseMode.HTML)
+                
+            except Exception as e:
+                logger.error(f"Ошибка при бане канала {channel_info['channel_id']}: {e}")
+                error_msg = get_error_message(e, "бана канала")
+                await message.answer(error_msg)
+            
+            return
+        
         # Проверяем, является ли это системным сообщением
         system_user = await extract_user_from_system_message(message.reply_to_message)
         if system_user:
@@ -903,6 +1019,55 @@ async def unban_command(message: Message):
     target_user = None
     
     if message.reply_to_message:
+        # Проверяем, является ли это сообщением от канала
+        channel_info = extract_channel_from_message(message.reply_to_message)
+        if channel_info:
+            # Это канал - разбаниваем его
+            if len(args) != 1:
+                await message.answer(
+                    "❌ <b>Некорректный формат команды</b>\n\n"
+                    "Использование:\n"
+                    "• <code>/unban</code> (при ответе на сообщение от канала)",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            try:
+                # Для каналов используем unban_chat_sender_chat
+                # Просто разбаниваем через API, не проверяем БД
+                await bot.unban_chat_sender_chat(
+                    chat_id=chat_id,
+                    sender_chat_id=channel_info['channel_id']
+                )
+                
+                # Деактивируем наказания в punishments (для истории)
+                active_bans = await moderation_db.get_active_punishments(chat_id, "ban")
+                for ban in active_bans:
+                    ban_channel_id = ban.get('channel_id')
+                    ban_user_id = ban.get('user_id')
+                    if ban_channel_id == channel_info['channel_id'] or (ban_user_id == channel_info['channel_id'] and ban_user_id < 0):
+                        await moderation_db.deactivate_punishment(ban['id'])
+                
+                channel_display = format_channel_mention(
+                    channel_info['channel_id'],
+                    channel_info['channel_username'],
+                    channel_info['channel_title']
+                )
+                
+                message_text = (
+                    f"✅ Канал {channel_display} был разбанен\n"
+                    f"<b>Модератор:</b> <i>{message.from_user.first_name or message.from_user.username or 'Неизвестно'}</i>"
+                )
+                
+                await send_message_with_gif(message, message_text, "unban", parse_mode=ParseMode.HTML)
+                
+            except Exception as e:
+                logger.error(f"Ошибка при разбане канала {channel_info['channel_id']}: {e}")
+                error_msg = get_error_message(e, "разбана канала")
+                await message.answer(error_msg)
+            
+            return
+        
         if len(args) != 1:
             await message.answer(
                 "❌ <b>Некорректный формат команды</b>\n\n"

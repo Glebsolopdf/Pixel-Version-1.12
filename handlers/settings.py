@@ -152,6 +152,8 @@ def register_settings_handlers(dispatcher: Dispatcher, bot_instance: Bot):
     dp.callback_query.register(utilities_reaction_spam_silent_callback, F.data == "utilities_reaction_spam_silent")
     dp.callback_query.register(utilities_fake_commands_callback, F.data == "utilities_fake_commands")
     dp.callback_query.register(utilities_fake_commands_toggle_callback, F.data == "utilities_fake_commands_toggle")
+    dp.callback_query.register(utilities_auto_ban_channels_callback, F.data == "utilities_auto_ban_channels")
+    dp.callback_query.register(utilities_auto_ban_channels_toggle_callback, F.data == "utilities_auto_ban_channels_toggle")
     dp.callback_query.register(utilities_back_callback, F.data == "utilities_back")
     
     dp.callback_query.register(resetconfig_confirm_callback, F.data == "resetconfig_confirm")
@@ -1960,6 +1962,7 @@ async def build_utilities_menu(chat_id: int):
     emoji_enabled = settings.get('emoji_spam_enabled', False)
     reaction_enabled = settings.get('reaction_spam_enabled', False)
     fake_commands_enabled = settings.get('fake_commands_enabled', False)
+    auto_ban_channels_enabled = settings.get('auto_ban_channels_enabled', False)
     
     builder.button(
         text=f"{'✅' if emoji_enabled else '❌'} Эмодзи спам",
@@ -1973,16 +1976,21 @@ async def build_utilities_menu(chat_id: int):
         text=f"{'✅' if fake_commands_enabled else '❌'} Ложные команды",
         callback_data="utilities_fake_commands"
     )
+    builder.button(
+        text=f"{'✅' if auto_ban_channels_enabled else '❌'} Автобан каналов Telegram",
+        callback_data="utilities_auto_ban_channels"
+    )
     builder.button(text="🔙 Назад", callback_data="settings_main")
     
-    builder.adjust(1, 1, 1)
+    builder.adjust(1, 1, 1, 1)
     
     text = (
         "🔧 <b>Утилиты</b>\n\n"
         "Дополнительные настройки защиты чата:\n\n"
         f"• <b>Эмодзи спам:</b> {'✅ Включено' if emoji_enabled else '❌ Выключено'}\n"
         f"• <b>Спам реакциями:</b> {'✅ Включено' if reaction_enabled else '❌ Выключено'}\n"
-        f"• <b>Ложные команды:</b> {'✅ Включено' if fake_commands_enabled else '❌ Выключено'}\n\n"
+        f"• <b>Ложные команды:</b> {'✅ Включено' if fake_commands_enabled else '❌ Выключено'}\n"
+        f"• <b>Автобан каналов Telegram:</b> {'✅ Включено' if auto_ban_channels_enabled else '❌ Выключено'}\n\n"
         "Выберите раздел:"
     )
     
@@ -2448,6 +2456,61 @@ async def utilities_fake_commands_toggle_callback(callback: CallbackQuery):
     except Exception as e:
         if "message is not modified" not in str(e):
             logger.error(f"Ошибка в utilities_fake_commands_toggle_callback: {e}")
+        await callback.answer()
+
+
+async def utilities_auto_ban_channels_callback(callback: CallbackQuery):
+    """Открыть настройки автоматического бана каналов"""
+    if not await _ensure_admin(callback):
+        return
+    
+    chat_id = callback.message.chat.id
+    settings = await utilities_db.get_settings(chat_id)
+    
+    enabled = settings.get('auto_ban_channels_enabled', False)
+    duration = settings.get('auto_ban_channels_duration', None)
+    
+    builder = InlineKeyboardBuilder()
+    
+    builder.button(
+        text=f"{'✅' if enabled else '❌'} {'Выключить' if enabled else 'Включить'}",
+        callback_data="utilities_auto_ban_channels_toggle"
+    )
+    builder.button(text="🔙 Назад", callback_data="utilities_back")
+    
+    builder.adjust(1, 1)
+    
+    text = (
+        "🔧 <b>Автобан каналов Telegram</b>\n\n"
+        f"<b>Статус:</b> {'✅ Включено' if enabled else '❌ Выключено'}\n\n"
+        "Бот автоматически банит каналы, которые отправляют сообщения от имени канала в чат, и удаляет их сообщения.\n\n"
+        "<i>Пересылка сообщений от каналов не запрещена. Баны применяются только к сообщениям, отправленным от имени канала.</i>\n"
+        "<i>Временный бан для каналов не поддерживается - все каналы банятся навсегда.</i>\n"
+        "<i>Ручные баны каналов модераторами сохраняются отдельно.</i>"
+    )
+    
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+async def utilities_auto_ban_channels_toggle_callback(callback: CallbackQuery):
+    """Переключить автоматический бан каналов"""
+    if not await _ensure_admin(callback):
+        return
+    
+    chat_id = callback.message.chat.id
+    settings = await utilities_db.get_settings(chat_id)
+    
+    current_enabled = settings.get('auto_ban_channels_enabled', False)
+    new_enabled = not current_enabled
+    
+    await utilities_db.update_setting(chat_id, 'auto_ban_channels_enabled', new_enabled)
+    
+    try:
+        await utilities_auto_ban_channels_callback(callback)
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            logger.error(f"Ошибка в utilities_auto_ban_channels_toggle_callback: {e}")
         await callback.answer()
 
 
